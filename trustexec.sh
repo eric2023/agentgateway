@@ -111,17 +111,13 @@ export NODE_EXTRA_CA_CERTS="$CERTS_DIR/ca-cert.pem"
 export AGENTGATEWAY_AGENT_ID="$AGENT_ID"
 export AGENTGATEWAY_SESSION_ID="$SESSION_ID"
 export AGENTGATEWAY_APP_NAME="$APP_NAME"
-# Force DDE system proxy to 'manual' mode pointing at the gateway.
-# Some apps (UOS AI, omp) read DDE proxy settings via gsettings and would
-# otherwise use 'auto' mode (PAC file) which bypasses the gateway.
-if command -v gsettings &>/dev/null; then
-    gsettings set org.gnome.system.proxy mode 'manual' 2>/dev/null || true
-    gsettings set org.gnome.system.proxy.http host "$GATEWAY_HOST" 2>/dev/null || true
-    gsettings set org.gnome.system.proxy.http port "$GATEWAY_PORT" 2>/dev/null || true
-    gsettings set org.gnome.system.proxy.https host "$GATEWAY_HOST" 2>/dev/null || true
-    gsettings set org.gnome.system.proxy.https port "$GATEWAY_PORT" 2>/dev/null || true
-    gsettings set org.gnome.system.proxy.autoconfig-url "" 2>/dev/null || true
-fi
+# System proxy (gsettings) management is now handled by the gateway daemon
+# itself (agentgatewayd.py: gw_proxy_setup/gw_proxy_restore).  Previously
+# trustexec.sh set gsettings to 'manual' and restored on exit, but daemon
+# processes (hermes, uos-ai-assistant) outlive trustexec, causing the proxy
+# to be restored while the daemon was still running.  The gateway process
+# owns the lifecycle: gsettings stays 'manual' while the gateway is alive
+# and is restored on shutdown.
 # Kill any existing persistent daemon for the target command.
 # Apps like omp spawn a background daemon that inherits the parent's env.
 # If an old daemon is running without proxy env vars, it will handle API
@@ -175,9 +171,10 @@ if [[ "$BPF_MODE" == "1" ]]; then
     fi
 fi
 
-# Execute the wrapped command. In --bpf mode, apply the Landlock file boundary
-# first (agent_landlock applies the ruleset then execs the real command, keeping
-# the same PID and cgroup membership).
+# Execute the wrapped command. The gateway daemon manages gsettings, so there is
+# no trap to fire — we can use exec directly. In --bpf mode, apply the Landlock
+# file boundary first (agent_landlock applies the ruleset then execs the real
+# command, keeping the same PID and cgroup membership).
 if [[ "$BPF_MODE" == "1" ]]; then
     LANDLOCK_BIN="$SCRIPT_DIR/bpf/agent_landlock"
     if [[ -x "$LANDLOCK_BIN" ]]; then
@@ -185,6 +182,4 @@ if [[ "$BPF_MODE" == "1" ]]; then
     fi
     echo "[agentgateway] WARN: bpf/agent_landlock not built; skipping Landlock" >&2
 fi
-
-# Execute the wrapped command
 exec "$@"

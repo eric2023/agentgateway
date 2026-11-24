@@ -31,6 +31,9 @@ import uuid
 import socket
 import select
 import threading
+import signal
+import atexit
+import subprocess
 import http.server
 import socketserver
 import urllib.parse
@@ -416,6 +419,10 @@ def _should_mitm(host):
 _proc_cache = {}          # port → (pid, comm, app_name, ts)
 _proc_cache_lock = threading.Lock()
 _proc_cache_ttl = 30.0    # seconds
+# Limit concurrent /proc/*/fd scans — each scan does thousands of readlinks.
+# Without a cap, a burst of CONNECTs spawns a burst of scanners that thrash
+# the kernel and starve the proxy's own I/O.
+_proc_scan_semaphore = threading.Semaphore(4)
 
 # Processes that are transport/tooling, not the agent itself.
 # When walking the parent chain we skip these to find the real agent process.
@@ -550,7 +557,6 @@ def _lookup_peer_process(client_socket):
 
     if not inode:
         return None, None, None
-
     target_link = f"socket:[{inode}]"
 
     # Scan /proc/*/fd/ to find which PID owns this socket.
@@ -594,33 +600,36 @@ def _lookup_peer_process(client_socket):
     search_inode = client_inode or inode
     search_link = f"socket:[{search_inode}]"
 
+    # The /proc/*/fd readlink scan is the expensive part (thousands of
+    # readlinks). Cap concurrent scans so a burst of CONNECTs can't spawn a
+    # burst of scanners that starves the proxy's own I/O.
     pid = None
-    try:
-        proc_dirs = [d for d in os.listdir("/proc") if d.isdigit()]
-    except OSError:
-        return None, None, None
-
-    # Skip our own PID — we want the peer, not ourselves
-    my_pid = os.getpid()
-    for pid_str in proc_dirs:
-        if int(pid_str) == my_pid:
-            continue
-        fd_dir = f"/proc/{pid_str}/fd"
+    with _proc_scan_semaphore:
         try:
-            fds = os.listdir(fd_dir)
-        except (OSError, PermissionError):
-            continue
-        for fd in fds:
+            proc_dirs = [d for d in os.listdir("/proc") if d.isdigit()]
+        except OSError:
+            return None, None, None
+
+        # Skip our own PID — we want the peer, not ourselves
+        my_pid = os.getpid()
+        for pid_str in proc_dirs:
+            if int(pid_str) == my_pid:
+                continue
+            fd_dir = f"/proc/{pid_str}/fd"
             try:
-                link = os.readlink(f"{fd_dir}/{fd}")
-                if link == search_link:
-                    pid = int(pid_str)
-                    break
+                fds = os.listdir(fd_dir)
             except (OSError, PermissionError):
                 continue
-        if pid is not None:
-            break
-
+            for fd in fds:
+                try:
+                    link = os.readlink(f"{fd_dir}/{fd}")
+                    if link == search_link:
+                        pid = int(pid_str)
+                        break
+                except (OSError, PermissionError):
+                    continue
+            if pid is not None:
+                break
     if pid is None:
         return None, None, None
 
@@ -671,15 +680,16 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
         port = int(port)
         session_id = getattr(self, "_session_id", "unknown")
 
-        # Identify the calling process via /proc
-        peer_pid, peer_comm, peer_app_name = _lookup_peer_process(self.connection)
-        self._peer_pid = peer_pid
-        self._peer_comm = peer_comm
-        self._peer_app_name = peer_app_name
-        if peer_comm:
-            log(f"[CONNECT] {host}:{port} (session={session_id}) from pid={peer_pid} comm={peer_comm} app={peer_app_name or '(none)'}")
-        else:
-            log(f"[CONNECT] {host}:{port} (session={session_id}) from pid=unknown")
+        # Identify the calling process via /proc — NON-BLOCKING.
+        # _lookup_peer_process scans /proc/*/fd/* (thousands of readlinks) and
+        # would stall the request for seconds, hanging every proxied request.
+        # Run it in a background thread; the main path responds immediately.
+        # Peer info is best-effort (used only for logging / app-source hints);
+        # do_TUNNELED joins the lookup before it needs peer_comm.
+        # Capture the raw TCP socket NOW — _do_mitm_connect/_handle_tls_tunnel
+        # will reassign self.connection to a TLS-wrapped socket, and the lookup
+        # must read /proc/net/tcp against the original connection.
+        self._start_peer_lookup(self.connection)
 
         # Track network event
         tracker.add_event(session_id, "network", {
@@ -693,6 +703,49 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
             self._do_mitm_connect(host, port, session_id)
         else:
             self._do_blind_tunnel(host, port, session_id)
+
+    def _start_peer_lookup(self, client_socket=None):
+        """Launch the background peer-process lookup (non-blocking).
+
+        _lookup_peer_process scans /proc/*/fd/* (thousands of readlinks); doing
+        it synchronously on the request path stalls every proxied request. We
+        run it in a daemon thread and store the result on self._peer_*; callers
+        that need peer info call _join_peer_lookup() first.
+
+        client_socket: the raw TCP socket to identify. Must be captured before
+        any TLS wrapping (self.connection gets reassigned in the MITM path).
+        """
+        # Avoid double-starting if a handler is reused across requests.
+        if getattr(self, "_peer_lookup", None) is not None:
+            return
+        sock = client_socket if client_socket is not None else self.connection
+        self._peer_lookup = threading.Thread(
+            target=self._run_peer_lookup, args=(sock,),
+            name="agw-peer-lookup", daemon=True
+        )
+        self._peer_lookup.start()
+
+    def _run_peer_lookup(self, client_socket):
+        """Background worker: resolve peer process info into self._peer_*."""
+        try:
+            peer_pid, peer_comm, peer_app_name = _lookup_peer_process(client_socket)
+        except Exception:
+            peer_pid, peer_comm, peer_app_name = None, None, None
+        self._peer_pid = peer_pid
+        self._peer_comm = peer_comm
+        self._peer_app_name = peer_app_name
+        session_id = getattr(self, "_session_id", "unknown")
+        host_port = getattr(self, "path", "?")
+        if peer_comm:
+            log(f"[CONNECT] {host_port} (session={session_id}) from pid={peer_pid} comm={peer_comm} app={peer_app_name or '(none)'}")
+        else:
+            log(f"[CONNECT] {host_port} (session={session_id}) from pid=unknown")
+
+    def _join_peer_lookup(self, timeout=0.0):
+        """Wait briefly for the background peer lookup, if still running."""
+        t = getattr(self, "_peer_lookup", None)
+        if t is not None and t.is_alive():
+            t.join(timeout)
 
     def _do_blind_tunnel(self, host, port, session_id):
         """Blind TCP tunnel — no TLS interception, just pipe bytes."""
@@ -833,6 +886,11 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
         # This is automatic and extensible — no keyword matching needed.
         # Browser auxiliary prediction requests are still detected from the
         # request body's system prompt and separated into their own session.
+        # The peer-process lookup ran in a background thread (see do_CONNECT);
+        # by now the TLS handshake + request read has consumed enough time
+        # that it is almost certainly done. Wait a little longer so peer_comm
+        # is available for app-source detection, then fall back gracefully.
+        self._join_peer_lookup(timeout=3.0)
         peer_pid = getattr(self, "_peer_pid", None)
         peer_comm = getattr(self, "_peer_comm", None)
 
@@ -1223,6 +1281,7 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         """Handle direct HTTP GET (non-CONNECT, for HTTP proxy)."""
         session_id = getattr(self, "_session_id", "unknown")
+        self._start_peer_lookup()
         # Parse the URL
         parsed = urllib.parse.urlparse(self.path)
         host = parsed.hostname
@@ -1242,6 +1301,7 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         """Handle direct HTTP POST."""
         session_id = getattr(self, "_session_id", "unknown")
+        self._start_peer_lookup()
         parsed = urllib.parse.urlparse(self.path)
         host = parsed.hostname
         port = parsed.port or 80
@@ -1268,7 +1328,10 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
         preview = detail.get("preview", "")
         prompt_len = detail.get("prompt_len", 0)
 
-        # Detect app source from peer process name
+        # Detect app source from peer process name. The peer-process lookup
+        # ran in a background thread (see _start_peer_lookup); wait briefly so
+        # peer_comm is available, then fall back gracefully.
+        self._join_peer_lookup(timeout=3.0)
         peer_comm = getattr(self, "_peer_comm", None)
         effective_app, is_browser_aux = detect_app_source(body, headers, peer_comm)
         effective_session = session_id
@@ -1388,6 +1451,82 @@ def make_handler_with_session(agent_id, session_id, app_name="unknown"):
     return SessionInjectedHandler
 
 
+# ─── System Proxy Management (gsettings) ─────────────────────────────────────
+# The gateway must set DDE's system proxy to 'manual' so that apps which read
+# gsettings (UOS AI, hermes, etc.) route through the gateway.  Previously
+# trustexec.sh did this, but trustexec exits immediately when the wrapped
+# command daemonizes (e.g. hermes), restoring the proxy while the daemon is
+# still running.  Moving the lifecycle to the gateway process itself ensures
+# the proxy stays 'manual' for as long as the gateway is alive.
+
+_GW_PROXY_RESTORE = None  # dict of snapshot values, or None if not set
+
+_GSETTINGS_KEYS = [
+    ("mode",           "org.gnome.system.proxy",       "mode"),
+    ("http_host",      "org.gnome.system.proxy.http",  "host"),
+    ("http_port",      "org.gnome.system.proxy.http",  "port"),
+    ("https_host",     "org.gnome.system.proxy.https", "host"),
+    ("https_port",     "org.gnome.system.proxy.https", "port"),
+    ("autoconfig_url", "org.gnome.system.proxy",       "autoconfig-url"),
+]
+
+
+def _gsettings_get(schema, key):
+    """Read a gsettings value, returning the raw gsettings variant string."""
+    try:
+        r = subprocess.run(
+            ["gsettings", "get", schema, key],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _gsettings_set(schema, key, value):
+    """Write a gsettings value. *value* is the bare string (not quoted)."""
+    try:
+        subprocess.run(
+            ["gsettings", "set", schema, key, value],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def gw_proxy_setup():
+    """Snapshot current system proxy settings and force 'manual' → gateway."""
+    global _GW_PROXY_RESTORE
+    if _GW_PROXY_RESTORE is not None:
+        return  # already set up
+    snap = {}
+    for name, schema, key in _GSETTINGS_KEYS:
+        snap[name] = _gsettings_get(schema, key)
+    _GW_PROXY_RESTORE = snap
+    _gsettings_set("org.gnome.system.proxy", "mode", "'manual'")
+    _gsettings_set("org.gnome.system.proxy.http", "host", f"'{GATEWAY_HOST}'")
+    _gsettings_set("org.gnome.system.proxy.http", "port", str(GATEWAY_PORT))
+    _gsettings_set("org.gnome.system.proxy.https", "host", f"'{GATEWAY_HOST}'")
+    _gsettings_set("org.gnome.system.proxy.https", "port", str(GATEWAY_PORT))
+    _gsettings_set("org.gnome.system.proxy", "autoconfig-url", "''")
+    log(f"[PROXY] System proxy set to manual → {GATEWAY_HOST}:{GATEWAY_PORT}")
+
+
+def gw_proxy_restore():
+    """Restore system proxy settings to their pre-gateway values."""
+    global _GW_PROXY_RESTORE
+    if _GW_PROXY_RESTORE is None:
+        return
+    snap = _GW_PROXY_RESTORE
+    for name, schema, key in _GSETTINGS_KEYS:
+        val = snap.get(name)
+        if val is not None:
+            _gsettings_set(schema, key, val)
+    _GW_PROXY_RESTORE = None
+    log("[PROXY] System proxy restored")
+
 def main():
     os.makedirs(AUDIT_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -1395,6 +1534,9 @@ def main():
 
     audit_init()
     load_ca()
+    gw_proxy_setup()
+    atexit.register(gw_proxy_restore)
+    signal.signal(signal.SIGTERM, lambda *_: (gw_proxy_restore(), sys.exit(0)))
 
     # Default session for standalone testing
     agent_id = os.environ.get("AGENTGATEWAY_AGENT_ID", f"agent-{uuid.uuid4().hex[:8]}")
