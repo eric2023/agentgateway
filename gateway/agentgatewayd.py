@@ -675,8 +675,10 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_CONNECT(self):
         """Handle HTTPS CONNECT.
 
-        For AI-related hosts: MITM TLS to inspect/audit requests.
-        For all other hosts: blind TCP tunnel (no TLS interception).
+        All HTTPS connections are MITM'd. TLS handshake failures (cert
+        pinning, untrusted CA on the client side) automatically fall back
+        to a blind tunnel so traffic still flows. AI request detection
+        happens at the HTTP layer inside the TLS tunnel, not by host name.
         """
         host, port = self.path.split(":")
         port = int(port)
@@ -700,11 +702,7 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
             "port": port,
         })
 
-        # Decide: MITM for AI hosts, blind tunnel for everything else
-        if _should_mitm(host):
-            self._do_mitm_connect(host, port, session_id)
-        else:
-            self._do_blind_tunnel(host, port, session_id)
+        self._do_mitm_connect(host, port, session_id)
 
     def _start_peer_lookup(self, client_socket=None):
         """Launch the background peer-process lookup (non-blocking).
@@ -749,11 +747,12 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
         if t is not None and t.is_alive():
             t.join(timeout)
 
-    def _do_blind_tunnel(self, host, port, session_id):
+    def _do_blind_tunnel(self, host, port, session_id, already_handshaked=False):
         """Blind TCP tunnel — no TLS interception, just pipe bytes."""
-        # Send 200 Connection Established
-        self.send_response(200, "Connection Established")
-        self.end_headers()
+        if not already_handshaked:
+            # Send 200 Connection Established
+            self.send_response(200, "Connection Established")
+            self.end_headers()
 
         # Connect to real server
         try:
@@ -788,7 +787,7 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
                 pass
 
     def _do_mitm_connect(self, host, port, session_id):
-        """Establish MITM TLS for AI-related hosts."""
+        """Establish MITM TLS; fall back to blind tunnel on failure."""
         # Send 200 Connection Established
         self.send_response(200, "Connection Established")
         self.end_headers()
@@ -803,8 +802,11 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
             tls_socket = client_ssl.wrap_socket(
                 self.connection, server_side=True,
             )
-        except ssl.SSLError as e:
-            log(f"[TLS] Failed to wrap {host}: {e}")
+        except (ssl.SSLError, OSError) as e:
+            # Client rejected our CA (cert pinning, untrusted CA, etc.).
+            # Fall back to blind tunnel so traffic still flows.
+            log(f"[TLS] MITM failed for {host}, falling back to tunnel: {e}")
+            self._do_blind_tunnel(host, port, session_id, already_handshaked=False)
             return
 
         # Now we have a TLS tunnel. Read HTTP requests from inside the tunnel.
