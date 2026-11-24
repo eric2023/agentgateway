@@ -26,6 +26,7 @@ enum agw_op {
     OP_FILE_OPEN      = 1,
     OP_SOCKET_CONNECT = 2,
     OP_BPRM_CHECK     = 3,
+    OP_BPF            = 4,
 };
 
 /* identity map value: cgroup_id -> agent identity (written by trustexec helper) */

@@ -62,6 +62,7 @@ static const char *op_str(__u32 op)
     case OP_SOCKET_CONNECT: return "socket_connect";
     case OP_FILE_OPEN:      return "file_open";
     case OP_BPRM_CHECK:     return "bprm_check";
+    case OP_BPF:            return "bpf";
     default:                return "unknown";
     }
 }

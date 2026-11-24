@@ -242,6 +242,37 @@ int BPF_PROG(agent_file_open, struct file *file)
 }
 
 /*
+ * bpf — self-protection (方案 B, P5). A managed agent has no business issuing
+ * bpf() syscalls; deny them in-kernel (defense-in-depth on top of
+ * kernel.unprivileged_bpf_disabled=2, which already blocks non-root BPF).
+ * This also makes it impossible for a managed agent to unload/inspect the
+ * AgentGateway programs or maps.
+ */
+SEC("lsm/bpf")
+int BPF_PROG(agent_bpf_check, int cmd, union bpf_attr *attr, unsigned int size)
+{
+	struct audit_event *ev;
+
+	if (!is_managed())
+		return 0;
+
+	ev = bpf_ringbuf_reserve(&audit_buf, sizeof(*ev), 0);
+	if (ev) {
+		__builtin_memset(ev, 0, sizeof(*ev));
+		ev->ts_ns = bpf_ktime_get_ns();
+		ev->pid = bpf_get_current_pid_tgid() >> 32;
+		ev->tgid = bpf_get_current_pid_tgid();
+		ev->op_type = OP_BPF;
+		ev->decision = DEC_DENY;
+		ev->result = -EPERM;
+		ev->dport = (__u16)cmd;
+		resolve_identity(ev);
+		bpf_ringbuf_submit(ev, 0);
+	}
+	return -EPERM;
+}
+
+/*
  * bprm_check — audit program execution for managed agents. bprm->filename is a
  * kernel pointer to the executable path; read directly in sleepable context.
  */
