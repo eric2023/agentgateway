@@ -80,6 +80,14 @@ do_start() {
     # Stop existing instances first (clean restart).
     do_stop 2>/dev/null || true
 
+    # Health checks: verify iptables rule and CA are installed
+    if [[ ! -f /etc/ssl/certs/agentgateway-ca.pem ]]; then
+        echo "[start.sh] WARNING: System CA not installed. Run './start.sh setup' first."
+    fi
+    if [[ ! -w /sys/fs/cgroup/net_cls/agentgateway/tasks ]]; then
+        echo "[start.sh] WARNING: cgroup not ready. Run './start.sh setup' first."
+    fi
+
     start_proc "transparent-proxy" "$TPROXY"   "$TPROXY_PIDFILE"   "$TPROXY_LOG"
     sleep 1.5   # let tproxy bind the port before dashboard
     start_proc "dashboard"         "$DASHBOARD" "$DASHBOARD_PIDFILE" "$DASHBOARD_LOG"

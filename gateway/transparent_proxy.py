@@ -104,6 +104,123 @@ def _redact_headers(headers):
             out[k] = v
     return out
 
+def _lookup_peer(client_socket):
+    """Identify the agent process on the other end of a REDIRECTed connection.
+
+    Unlike the CONNECT proxy (where the client connects to :8443), with
+    iptables REDIRECT the client thinks it's connecting to :443 — the kernel
+    transparently redirects to :8444. So in /proc/net/tcp the client-side
+    socket shows remote=<orig_dst_ip>:443, not remote=127.0.0.1:8444.
+
+    Returns (pid, comm, app_name, agent_id, session_id) or all-None.
+    """
+    try:
+        peer_addr = client_socket.getpeername()
+        local_addr = client_socket.getsockname()
+    except OSError:
+        return None, None, None, None, None
+
+    peer_ip = peer_addr[0]
+    peer_port = peer_addr[1]
+    local_port = local_addr[1]
+    now = time.time()
+    # Check cache
+    with gw._proc_cache_lock:
+        cached = gw._proc_cache.get(peer_port)
+        if cached and (now - cached[3]) < gw._proc_cache_ttl:
+            return cached[0], cached[1], cached[2], None, None
+
+    # The server-side socket (local=:8444, remote=client:peer_port) gives us
+    # the inode, but that inode belongs to the proxy process. We need the
+    # CLIENT-side socket: local=client:peer_port, remote=<orig_dst>:443.
+    # With REDIRECT, the client's remote port is always 443.
+    client_inode = None
+    try:
+        with open("/proc/net/tcp") as f:
+            f.readline()
+            for line in f:
+                parts = line.split()
+                if len(parts) < 10:
+                    continue
+                local_hex = parts[1]
+                rem_hex = parts[2]
+                state = parts[3]
+                if state != "01":  # ESTABLISHED
+                    continue
+                l_port = int(local_hex.split(":")[1], 16)
+                r_port = int(rem_hex.split(":")[1], 16)
+                # Client side: local=client_port, remote=:443
+                if l_port == peer_port and r_port == 443:
+                    client_inode = parts[9]
+                    break
+    except OSError:
+        return None, None, None, None, None
+
+    if not client_inode:
+        return None, None, None, None, None
+
+    search_link = f"socket:[{client_inode}]"
+
+    # Scan /proc/*/fd/ to find which PID owns this socket
+    pid = None
+    with gw._proc_scan_semaphore:
+        try:
+            proc_dirs = [d for d in os.listdir("/proc") if d.isdigit()]
+        except OSError:
+            return None, None, None, None, None
+
+        my_pid = os.getpid()
+        for pid_str in proc_dirs:
+            if int(pid_str) == my_pid:
+                continue
+            fd_dir = f"/proc/{pid_str}/fd"
+            try:
+                fds = os.listdir(fd_dir)
+            except (OSError, PermissionError):
+                continue
+            for fd in fds:
+                try:
+                    link = os.readlink(f"{fd_dir}/{fd}")
+                    if link == search_link:
+                        pid = int(pid_str)
+                        break
+                except (OSError, PermissionError):
+                    continue
+            if pid is not None:
+                break
+
+    if pid is None:
+        return None, None, None, None, None
+
+    # Walk parent chain to find the real agent process
+    agent_pid, agent_comm = gw._resolve_agent_process(pid)
+
+    app_name = None
+    agent_id = None
+    session_id = None
+    # Read AGENTGATEWAY_* from the DIRECT process (pid), not the resolved
+    # agent. trustexec.sh exec's the command, so the direct process (e.g.
+    # curl) inherits trustexec's environment. The parent agent process
+    # (e.g. omp) doesn't have these vars.
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            env = f.read()
+        for entry in env.split(b"\x00"):
+            if entry.startswith(b"AGENTGATEWAY_APP_NAME="):
+                app_name = entry.split(b"=", 1)[1].decode("utf-8", "replace")
+            elif entry.startswith(b"AGENTGATEWAY_AGENT_ID="):
+                agent_id = entry.split(b"=", 1)[1].decode("utf-8", "replace")
+            elif entry.startswith(b"AGENTGATEWAY_SESSION_ID="):
+                session_id = entry.split(b"=", 1)[1].decode("utf-8", "replace")
+    except (OSError, PermissionError):
+        pass
+
+    # Cache the result
+    with gw._proc_cache_lock:
+        gw._proc_cache[peer_port] = (agent_pid, agent_comm, app_name, now)
+
+    return agent_pid, agent_comm, app_name, agent_id, session_id
+
 
 def _dechunk(data):
     result = b""
@@ -312,6 +429,14 @@ def _mitm(client, host, rfile_hint=b""):
         is_ai, confidence, signals, detail = gw.detect_ai_request(method, path, headers, body)
         request_id = f"{REQUEST_ID_PREFIX}-{uuid.uuid4().hex[:6]}"
 
+        try:
+            peer_pid, peer_comm, peer_app, peer_agent, peer_session = _lookup_peer(tls)
+        except Exception:
+            peer_pid, peer_comm, peer_app, peer_agent, peer_session = None, None, None, None, None
+        audit_app = peer_app or peer_comm or "transparent"
+        audit_agent = peer_agent or AGENT_ID
+        audit_session = peer_session or SESSION_ID
+
         status = 0
         resp_body = b""
         fwd_ok = True
@@ -327,9 +452,9 @@ def _mitm(client, host, rfile_hint=b""):
             event = {
                 "event": "ai_request_audited",
                 "decision": "AUDIT",
-                "app_name": "transparent",
-                "session_id": SESSION_ID,
-                "agent_id": AGENT_ID,
+                "app_name": audit_app,
+                "session_id": audit_session,
+                "agent_id": audit_agent,
                 "request_id": request_id,
                 "method": method,
                 "host": host,

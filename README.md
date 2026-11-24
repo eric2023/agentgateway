@@ -189,6 +189,8 @@ cd agentgateway
 
 trustexec 将当前进程写入 cgroup `net_cls/agentgateway/tasks`，Agent 启动后其 :443 出向流量自动被 iptables 重定向到透明代理。Agent **零改造、零环境变量**。
 
+**Agent 身份归因**：trustexec 设置 `AGENTGATEWAY_APP_NAME`、`AGENTGATEWAY_AGENT_ID`、`AGENTGATEWAY_SESSION_ID` 环境变量。透明代理通过 `/proc/net/tcp` + `/proc/*/fd` 找到发起连接的进程，读取其环境变量中的 Agent 身份信息，写入审计日志。即使 Agent 通过 curl/python3 等工具进程发送请求，代理也能沿父进程链追溯到真正的 Agent 进程（如 omp），并从工具进程的环境变量中获取 trustexec 设置的身份信息。
+
 ### 验证拦截
 
 ```bash
@@ -318,7 +320,7 @@ sudo bash setup_iptables.sh --cleanup
 ## 技术方案文档
 
 - [`specs/方案A_透明代理进程级拦截_4.19内核.md`](specs/方案A_透明代理进程级拦截_4.19内核.md) — 透明代理进程级拦截方案（当前实现，适用于 4.19 内核）
-
+- [`specs/方案B_BPF-LSM内核级管控_6.6内核.md`](specs/方案B_BPF-LSM内核级管控_6.6内核.md) — BPF-LSM 内核级管控方案（V25，含文件访问管控，适用于 6.6+ 内核）
 ## 开源许可
 
 本项目基于 [Apache License 2.0](LICENSE) 开源。
