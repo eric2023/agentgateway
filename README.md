@@ -6,24 +6,43 @@ AgentGateway 在 AI Agent 与大模型 API 之间部署一个本地 HTTPS 代理
 
 ## 架构
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        目标主机 (本机 127.0.0.1)                  │
-│                                                                  │
-│  ┌─────────┐  HTTPS_PROXY / PI_PROXY  ┌──────────────┐           │
-│  │ UOS AI  │ ──────────────────────►  │ AgentGateway │ ───────►  │
-│  │ Browser │        (8443)            │  (MITM 代理)  │  上游 TLS │
-│  │  omp    │                          └──────┬───────┘           │
-│  └─────────┘                                  │ 审计日志           │
-│       ▲                               ┌───────▼───────┐           │
-│       │ LD_PRELOAD libauditshim.so    │ audit.jsonl   │           │
-│       │ (TLS 验证绕过 + 明文捕获)      └───────┬───────┘           │
-│       │                                       │ 读取              │
-│   trustexec.sh                       ┌───────▼───────┐           │
-│   (环境注入包装器)                    │   Dashboard    │           │
-│                                      │  (HTTP :9090)  │           │
-│                                      └───────────────┘           │
-└──────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph 应用层["应用层（零改造）"]
+        Agent["Agent 进程<br/>omp / UOS AI / WorkBuddy"]
+    end
+
+    subgraph 注入层["trustexec.sh 环境注入"]
+        ProxyENV["HTTPS_PROXY / PI_PROXY<br/>→ 127.0.0.1:8443"]
+        TrustENV["SSL_CERT_FILE / NODE_EXTRA_CA_CERTS<br/>→ AgentGateway CA"]
+        PreloadENV["LD_PRELOAD<br/>→ libauditshim.so"]
+    end
+
+    subgraph 运行时层["运行时层"]
+        GW["AgentGateway agentgatewayd<br/>MITM 代理 :8443 / L7 识别"]
+    end
+
+    subgraph 审计层["审计与展示层"]
+        AuditLog["audit/audit.jsonl<br/>JSONL 审计日志"]
+        Dash["Dashboard<br/>Web UI :9090 / dashboard.py"]
+    end
+
+    Agent -->|"trustexec 包装"| ProxyENV
+    ProxyENV -->|"1 CONNECT host:443"| GW
+    TrustENV -->|"信任 AgentGateway CA"| Agent
+    PreloadENV -->|"TLS 明文采集（备份）"| Agent
+    Agent -->|"2 TLS 明文 HTTP"| GW
+    GW -->|"3 动态签发证书"| Agent
+    GW -->|"4 识别 + 审计写入"| AuditLog
+    GW -->|"5 原样转发"| Upstream["上游 AI API<br/>TLS"]
+    GW -->|"6 /proc 反查来源进程"| Agent
+    Dash -->|"读取"| AuditLog
+
+    Browser["浏览器"] -->|"HTTP :9090"| Dash
+
+    style GW fill:#4a9eff,color:#fff
+    style AuditLog fill:#22c55e,color:#fff
+    style Dash fill:#f59e0b,color:#fff
 ```
 
 ### 工作原理
