@@ -76,6 +76,37 @@ AI_AUTH_HEADERS = [
     "anthropic-version",
     "x-goog-api-key",     # Gemini
 ]
+# Hosts that may carry AI model API calls and should be MITM'd for inspection.
+# Everything else is blind-tunneled (zero overhead — just a TCP pipe).
+AI_HOST_PATTERNS = [
+    "openai.com",
+    "anthropic.com",
+    "api.deepseek.com",
+    "dashscope.aliyuncs.com",
+    "moonshot.cn",
+    "bigmodel.cn",
+    "ai.uniontech.com",       # UOS AI API
+    "uosai.uniontech.com",    # UOS AI model config
+    "xiaou.uniontech.com",    # UOS AI auth/usage
+    "agent-dev.uniontech.com",  # UOS AI agent dev
+    "agentapi-dev.uniontech.com",
+    "immersivetranslate.com",
+    "copilot.tencent.com",
+    "codebuddy.cn",
+    "githubcopilot.com",
+    "generativelanguage.googleapis.com",  # Gemini
+    "aip.baidubce.com",  # ERNIE Bot
+    "minimaxi.com",
+    "spark-api.xf-yun.com",
+]
+
+def should_mitm(host):
+    """Return True if the host may carry AI API calls (needs TLS inspection)."""
+    host_lower = host.lower()
+    for pattern in AI_HOST_PATTERNS:
+        if host_lower == pattern or host_lower.endswith("." + pattern):
+            return True
+    return False
 
 AI_BODY_SIGNALS = [
     "model", "messages", "prompt", "max_tokens", "temperature",
@@ -711,21 +742,15 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_CONNECT(self):
         """Handle HTTPS CONNECT.
 
-        All HTTPS connections are MITM'd. TLS handshake failures (cert
-        pinning, untrusted CA on the client side) automatically fall back
-        to a blind tunnel so traffic still flows. AI request detection
-        happens at the HTTP layer inside the TLS tunnel, not by host name.
+        Only hosts that may carry AI API calls are MITM'd (for request
+        inspection). All other HTTPS traffic is blind-tunneled with zero
+        overhead — just a bidirectional TCP pipe, no double TLS, no
+        response buffering.
         """
         host, port = self.path.split(":")
         port = int(port)
         session_id = getattr(self, "_session_id", "unknown")
 
-        # Identify the calling process via /proc — NON-BLOCKING.
-        # _lookup_peer_process scans /proc/*/fd/* (thousands of readlinks) and
-        # would stall the request for seconds, hanging every proxied request.
-        # Run it in a background thread; the main path responds immediately.
-        # Peer info is best-effort (used only for logging / app-source hints);
-        # do_TUNNELED joins the lookup before it needs peer_comm.
         # Capture the raw TCP socket NOW — _do_mitm_connect/_handle_tls_tunnel
         # will reassign self.connection to a TLS-wrapped socket, and the lookup
         # must read /proc/net/tcp against the original connection.
@@ -738,7 +763,10 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
             "port": port,
         })
 
-        self._do_mitm_connect(host, port, session_id)
+        if should_mitm(host):
+            self._do_mitm_connect(host, port, session_id)
+        else:
+            self._do_blind_tunnel(host, port, session_id)
 
     def _start_peer_lookup(self, client_socket=None):
         """Launch the background peer-process lookup (non-blocking).
