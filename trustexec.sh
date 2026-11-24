@@ -9,7 +9,7 @@
 #
 # AgentGateway trustexec — Agent wrapper that injects proxy + CA trust + LD_PRELOAD.
 #
-# Usage: trustexec.sh [--app <name>] [--agent-id <uuid>] <command> [args...]
+# Usage: trustexec.sh [--app <name>] [--agent-id <uuid>] [--bpf] <command> [args...]
 #
 # Sets:
 #   SSL_CERT_FILE             → AgentGateway CA cert (for OpenSSL/Qt apps)
@@ -34,6 +34,7 @@ GATEWAY_PORT="8443"
 APP_NAME="unknown"
 AGENT_ID=""
 SESSION_ID=""
+BPF_MODE="0"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -50,6 +51,10 @@ while [[ $# -gt 0 ]]; do
             SESSION_ID="$2"
             shift 2
             ;;
+        --bpf)
+            BPF_MODE="1"
+            shift
+            ;;
         --)
             shift
             break
@@ -65,7 +70,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $# -eq 0 ]]; then
-    echo "Usage: trustexec.sh [--app <name>] [--agent-id <uuid>] <command> [args...]"
+    echo "Usage: trustexec.sh [--app <name>] [--agent-id <uuid>] [--bpf] <command> [args...]"
     exit 1
 fi
 
@@ -150,6 +155,36 @@ echo "[agentgateway] CA cert:    $SSL_CERT_FILE"
 echo "[agentgateway] Command:    $@"
 echo "[agentgateway] LD_PRELOAD: ${LD_PRELOAD:-none}"
 echo "[agentgateway] ─────────────────────────────────"
+
+# ── 方案 B: BPF-LSM cgroup admission (optional, --bpf) ─────────────────────
+# Create the per-agent cgroup, record identity in the pinned identity_map, and
+# move this shell (which execs the agent) into it. Once inside, the BPF-LSM
+# program treats the process as managed and can enforce in-kernel DENY.
+if [[ "$BPF_MODE" == "1" ]]; then
+    ADMIT_BIN="$SCRIPT_DIR/bpf/agent_admit"
+    if [[ -x "$ADMIT_BIN" ]]; then
+        if command -v sudo >/dev/null 2>&1; then
+            sudo "$ADMIT_BIN" "$AGENT_ID" "$AGENT_ID" "$SESSION_ID" "$APP_NAME" "$$" \
+                || echo "[agentgateway] WARN: BPF admission failed (need root)" >&2
+        else
+            "$ADMIT_BIN" "$AGENT_ID" "$AGENT_ID" "$SESSION_ID" "$APP_NAME" "$$" \
+                || echo "[agentgateway] WARN: BPF admission failed" >&2
+        fi
+    else
+        echo "[agentgateway] WARN: bpf/agent_admit not built (run: make -C bpf)" >&2
+    fi
+fi
+
+# Execute the wrapped command. In --bpf mode, apply the Landlock file boundary
+# first (agent_landlock applies the ruleset then execs the real command, keeping
+# the same PID and cgroup membership).
+if [[ "$BPF_MODE" == "1" ]]; then
+    LANDLOCK_BIN="$SCRIPT_DIR/bpf/agent_landlock"
+    if [[ -x "$LANDLOCK_BIN" ]]; then
+        exec "$LANDLOCK_BIN" --allow "$PWD" -- "$@"
+    fi
+    echo "[agentgateway] WARN: bpf/agent_landlock not built; skipping Landlock" >&2
+fi
 
 # Execute the wrapped command
 exec "$@"

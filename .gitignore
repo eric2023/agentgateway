@@ -15,6 +15,16 @@ gateway/libauditshim.so
 *.pyc
 __pycache__/
 
+# BPF build artifacts (regenerated via `make -C bpf`)
+bpf/vmlinux.h
+bpf/*.o
+bpf/*.skel.h
+bpf/agent_lsm
+bpf/audit_consumer
+bpf/cgroupid
+bpf/agent_admit
+bpf/agent_landlock
+
 # OS files
 .DS_Store
 *.swp
