@@ -2,6 +2,7 @@
 certs/dyn-*
 certs/*-key.pem
 certs/ca-key.pem
+certs/ca-cert.pem
 
 # Logs
 logs/
