@@ -43,6 +43,16 @@ int main(int argc, char **argv)
     cfg.enable_deny_443 = 1;
     cfg.audit_file_open = 1;
     cfg.audit_bprm_check = 1;
+    cfg.enforce_file_write = 0; /* default off; enable via AGW_ENFORCE_FILE_WRITE=1 */
+    {
+        const char *allow = getenv("AGW_WRITE_ALLOW");
+        if (allow)
+            strncpy(cfg.write_allow_dir, allow, sizeof(cfg.write_allow_dir) - 1);
+        else
+            cfg.write_allow_dir[0] = 0;
+    }
+    if (getenv("AGW_ENFORCE_FILE_WRITE"))
+        cfg.enforce_file_write = 1;
 
     if (bump_rlimit()) {
         fprintf(stderr, "setrlimit: %s\n", strerror(errno));

@@ -54,9 +54,11 @@ struct rule_value {
 
 /* runtime config (config_map[0]) */
 struct agent_config {
-    __u32 enable_deny_443;   /* deny direct non-loopback :443 for managed agents */
-    __u32 audit_file_open;   /* emit audit on managed file open */
-    __u32 audit_bprm_check;  /* emit audit on managed exec */
+    __u32 enable_deny_443;      /* deny direct non-loopback :443 for managed agents */
+    __u32 audit_file_open;      /* emit audit on managed file open */
+    __u32 audit_bprm_check;     /* emit audit on managed exec */
+    __u32 enforce_file_write;   /* deny write-opens outside write_allow_dir */
+    char write_allow_dir[256];  /* allowed write dir prefix (global, v1) */
 };
 
 /* ring-buffer audit event (audit_buf) */

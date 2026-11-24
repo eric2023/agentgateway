@@ -141,37 +141,104 @@ int BPF_PROG(agent_socket_connect, struct socket *sock,
 	return 0;
 }
 
+/* bpf_d_path is declared in <bpf/bpf_helper_defs.h> (helper id 147). */
+
+#define O_WRONLY 1
+#define O_RDWR   2
+#define O_CREAT  0x40
+#define O_TRUNC  0x200
+
+static __always_inline int path_starts_with(const char *path, const char *prefix,
+					    __u32 prefix_len)
+{
+	for (__u32 i = 0; i < prefix_len && i < AGW_PATH_MAXLEN; i++) {
+		if (prefix[i] == '\0')
+			break;
+		if (path[i] != prefix[i])
+			return 0;
+	}
+	return 1;
+}
+
+static __always_inline __u32 str_len(const char *s, __u32 max)
+{
+	__u32 i = 0;
+	for (; i < max; i++)
+		if (s[i] == '\0')
+			break;
+	return i;
+}
+
 /*
- * file_open — audit trail for managed agents (path resolution via bpf_d_path
- * kfunc is a P2 refinement; v1 records the open without a path).
+ * file_open — file boundary (方案 B, P2). With enforce_file_write, deny
+ * write-opens (O_WRONLY/O_RDWR/O_CREAT/O_TRUNC) whose resolved path is outside
+ * write_allow_dir. Sleepable (lsm.s) so bpf_d_path is available.
  */
-SEC("lsm/file_open")
+SEC("lsm.s/file_open")
 int BPF_PROG(agent_file_open, struct file *file)
 {
-    __u32 key = 0;
-    struct agent_config *cfg;
-    struct audit_event *ev;
+	__u32 key = 0;
+	struct agent_config *cfg;
+	struct audit_event *ev;
+	char path[AGW_PATH_MAXLEN];
+	__u32 prefix_len;
+	int path_len;
+	int write_open;
 
-    if (!is_managed())
-        return 0;
+	if (!is_managed())
+		return 0;
 
-    cfg = bpf_map_lookup_elem(&config_map, &key);
-    if (!cfg || !cfg->audit_file_open)
-        return 0;
+	cfg = bpf_map_lookup_elem(&config_map, &key);
+	if (!cfg)
+		return 0;
 
-    ev = bpf_ringbuf_reserve(&audit_buf, sizeof(*ev), 0);
-    if (ev) {
-        __builtin_memset(ev, 0, sizeof(*ev));
-        ev->ts_ns = bpf_ktime_get_ns();
-        ev->pid = bpf_get_current_pid_tgid() >> 32;
-        ev->tgid = bpf_get_current_pid_tgid();
-        ev->op_type = OP_FILE_OPEN;
-        ev->decision = DEC_AUDIT;
-        ev->result = 0;
-        resolve_identity(ev);
-        bpf_ringbuf_submit(ev, 0);
-    }
-    return 0;
+	write_open = ((file->f_flags & (O_WRONLY | O_RDWR)) != 0) ||
+		     ((file->f_flags & (O_CREAT | O_TRUNC)) != 0);
+
+	path[0] = 0;
+	path_len = bpf_d_path(&file->f_path, path, sizeof(path));
+
+	if (cfg->enforce_file_write && write_open) {
+		prefix_len = str_len(cfg->write_allow_dir,
+				     sizeof(cfg->write_allow_dir));
+		if (prefix_len > 0 && path_len > 0 &&
+		    !path_starts_with(path, cfg->write_allow_dir, prefix_len)) {
+			ev = bpf_ringbuf_reserve(&audit_buf, sizeof(*ev), 0);
+			if (ev) {
+				__builtin_memset(ev, 0, sizeof(*ev));
+				ev->ts_ns = bpf_ktime_get_ns();
+				ev->pid = bpf_get_current_pid_tgid() >> 32;
+				ev->tgid = bpf_get_current_pid_tgid();
+				ev->op_type = OP_FILE_OPEN;
+				ev->decision = DEC_DENY;
+				ev->result = -1;
+				resolve_identity(ev);
+				if (path_len > 0)
+					__builtin_memcpy(ev->path, path, sizeof(ev->path));
+				bpf_ringbuf_submit(ev, 0);
+			}
+			return -1;
+		}
+	}
+
+	if (cfg->audit_file_open) {
+		ev = bpf_ringbuf_reserve(&audit_buf, sizeof(*ev), 0);
+		if (ev) {
+			__builtin_memset(ev, 0, sizeof(*ev));
+			ev->ts_ns = bpf_ktime_get_ns();
+			ev->pid = bpf_get_current_pid_tgid() >> 32;
+			ev->tgid = bpf_get_current_pid_tgid();
+			ev->op_type = OP_FILE_OPEN;
+			ev->decision = DEC_AUDIT;
+			ev->result = 0;
+			resolve_identity(ev);
+			if (path_len > 0)
+				__builtin_memcpy(ev->path, path, sizeof(ev->path));
+			bpf_ringbuf_submit(ev, 0);
+		}
+	}
+
+	return 0;
 }
 
 /*

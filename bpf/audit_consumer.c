@@ -138,7 +138,14 @@ int main(int argc, char **argv)
     int map_fd = -1;
     int err = 1;
 
-    map_fd = bpf_obj_get(pin_path);
+    /* retry: the loader may still be attaching/pinning (esp. with a large
+     * verifier run). Give it up to ~5s before giving up. */
+    for (int attempt = 0; attempt < 50; attempt++) {
+        map_fd = bpf_obj_get(pin_path);
+        if (map_fd >= 0)
+            break;
+        usleep(100000);
+    }
     if (map_fd < 0) {
         fprintf(stderr, "bpf_obj_get(%s): %s\n", pin_path, strerror(errno));
         fprintf(stderr, "is the loader (agent_lsm) running as root?\n");
