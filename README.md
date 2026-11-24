@@ -624,9 +624,10 @@ gsettings set org.gnome.system.proxy mode 'auto'
 | P2 文件边界 | BPF-LSM `file_open` 写白名单外 → `-EPERM` | ✅ 验证通过 |
 | P3 透明代理 | nftables `redirect` :443 → :8444 + SNI MITM | ✅ 验证通过 |
 | P3 明文采集 | BPF uprobe `SSL_write` / `gnutls_record_send` | ✅ 验证通过 |
+| P4 同步确认 | seccomp USER_NOTIF trap `execve` → 同步 DENY/ALLOW | ✅ 验证通过 |
 | P5 自保护 | BPF-LSM `bpf` 禁止受管进程 `bpf()` | ✅ 验证通过 |
 
-> **环境限制**：本机内核未编译 Landlock（`CONFIG_SECURITY_LANDLOCK=n`），文件边界改用 BPF-LSM `file_open` 实现（spec 的主机制）。seccomp USER_NOTIF 为可选同步确认增强，暂未实施。
+> **环境限制**：本机内核未编译 Landlock（`CONFIG_SECURITY_LANDLOCK=n`），文件边界改用 BPF-LSM `file_open` 实现（spec 的主机制）。
 
 ### 构建与部署
 
