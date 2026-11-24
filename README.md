@@ -612,6 +612,48 @@ gsettings set org.gnome.system.proxy mode 'auto'
 - **无 root 权限**：CA 证书无法写入 `/etc/ssl/certs/`，需通过环境变量或 NSS 证书库信任
 - **快速连接识别失败**：`_lookup_peer_process()` 需要在连接存活时扫描 `/proc/net/tcp`，对于极快的连接（如 curl 立即退出）可能失败。30 秒缓存可缓解重复连接的情况
 
+## 方案B 实施状态（V25 / 6.6 内核）
+
+方案 B 已在本机（`6.6.0-amd64-desktop`，`bpf` LSM 激活）落地以下内核级管控能力，全部实测验证：
+
+| 组件 | 机制 | 状态 |
+|------|------|------|
+| P1 网络强制 | BPF-LSM `socket_connect` 内核内 DENY 受管 Agent 直连 443 | ✅ 验证通过 |
+| P1 身份模型 | cgroup → `identity_map`（内核内，不可篡改） | ✅ 验证通过 |
+| P1 审计通道 | BPF ring buffer → `audit.jsonl` | ✅ 验证通过 |
+| P2 文件边界 | BPF-LSM `file_open` 写白名单外 → `-EPERM` | ✅ 验证通过 |
+| P3 透明代理 | nftables `redirect` :443 → :8444 + SNI MITM | ✅ 验证通过 |
+| P3 明文采集 | BPF uprobe `SSL_write` / `gnutls_record_send` | ✅ 验证通过 |
+| P5 自保护 | BPF-LSM `bpf` 禁止受管进程 `bpf()` | ✅ 验证通过 |
+
+> **环境限制**：本机内核未编译 Landlock（`CONFIG_SECURITY_LANDLOCK=n`），文件边界改用 BPF-LSM `file_open` 实现（spec 的主机制）。seccomp USER_NOTIF 为可选同步确认增强，暂未实施。
+
+### 构建与部署
+
+```bash
+# 1. 工具链（clang-17 / bpftool / libbpf-dev，userspace 免 root 编译，已解压到 ~/agentgateway-toolchain）
+make -C bpf all
+
+# 2. 加载 BPF-LSM（需 root）
+sudo ./bpf/agent_lsm &                        # socket_connect / file_open / bpf 管控
+sudo ./bpf/audit_consumer audit/audit.jsonl & # ring buffer → JSONL
+
+# 3. 纳入 Agent（cgroup 身份 + 文件边界）
+sudo ./bpf/agent_admit <name> <agent-id> <session-id> <app> <pid>
+
+# 4. 透明代理（可选：nftables 强制重定向，无需 HTTPS_PROXY）
+sudo ./bpf/setup_transparent.sh
+
+# 5. 明文采集（可选：内核态 uprobe）
+sudo ./bpf/agent_uprobe &
+sudo ./bpf/agent_uprobe_consumer audit/audit-tls.jsonl &
+
+# 验证 P1 DENY 闭环
+sudo bash bpf/verify_p1.sh
+```
+
+> **关键发现**：本机 `socket_connect` LSM hook 的 `sockaddr` 是内核指针（`bpf_probe_read_user` 返回 `-EFAULT`），需用 `bpf_probe_read_kernel` 读取——与上游假设的 user 指针不同。
+
 ## 技术方案文档
 
 - [`specs/方案A_用户态验证_4.19内核.md`](specs/方案A_用户态验证_4.19内核.md) — 用户态拦截方案（当前实现，适用于 4.19 内核）

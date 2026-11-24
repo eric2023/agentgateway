@@ -2,7 +2,7 @@
 
 > **Spec ID**: AGW-SPEC-B
 > **适用平台**: UOS V25 + Linux 6.6 LTS 内核，需 root (CAP_BPF + CAP_SYS_ADMIN)
-> **验证状态**: ⏳ 待在 V25 机器上实施验证（P0 用户态子集已完成，即方案 A）
+> **验证状态**: ✅ P1/P2/P3/P5 已在本机（6.6.0-amd64-desktop）实施并验证通过；Landlock 不可用（内核未编译）改用 BPF-LSM `file_open`；seccomp USER_NOTIF（P4）为可选项待实施
 > **定位**: 生产级方案，内核内同步决策，不可被 Agent 绕过
 
 ---
