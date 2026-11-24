@@ -106,10 +106,42 @@ export NODE_EXTRA_CA_CERTS="$CERTS_DIR/ca-cert.pem"
 export AGENTGATEWAY_AGENT_ID="$AGENT_ID"
 export AGENTGATEWAY_SESSION_ID="$SESSION_ID"
 export AGENTGATEWAY_APP_NAME="$APP_NAME"
-# Force DDE system proxy to 'manual' mode pointing at the gateway.
+# Temporarily force DDE system proxy to 'manual' mode pointing at the gateway.
 # Some apps (UOS AI, omp) read DDE proxy settings via gsettings and would
 # otherwise use 'auto' mode (PAC file) which bypasses the gateway.
+# IMPORTANT: this is a *global* setting, so it affects every app on the
+# desktop (browsers included). We snapshot the previous values and restore
+# them when the wrapped command exits, so the system is never left pinned
+# to a dead gateway after the agent stops.
+_GW_RESTORE_PROXY=0
+_GW_PREV_MODE=""
+_GW_PREV_HTTP_HOST=""
+_GW_PREV_HTTP_PORT=""
+_GW_PREV_HTTPS_HOST=""
+_GW_PREV_HTTPS_PORT=""
+_GW_PREV_AUTOCONFIG_URL=""
+_gw_restore_proxy() {
+    if [[ "$_GW_RESTORE_PROXY" != "1" ]]; then
+        return 0
+    fi
+    gsettings set org.gnome.system.proxy mode "$_GW_PREV_MODE" 2>/dev/null || true
+    gsettings set org.gnome.system.proxy.http host "$_GW_PREV_HTTP_HOST" 2>/dev/null || true
+    gsettings set org.gnome.system.proxy.http port "$_GW_PREV_HTTP_PORT" 2>/dev/null || true
+    gsettings set org.gnome.system.proxy.https host "$_GW_PREV_HTTPS_HOST" 2>/dev/null || true
+    gsettings set org.gnome.system.proxy.https port "$_GW_PREV_HTTPS_PORT" 2>/dev/null || true
+    gsettings set org.gnome.system.proxy.autoconfig-url "$_GW_PREV_AUTOCONFIG_URL" 2>/dev/null || true
+    _GW_RESTORE_PROXY=0
+}
 if command -v gsettings &>/dev/null; then
+    # Snapshot current values (so we can restore exactly what was there).
+    _GW_PREV_MODE="$(gsettings get org.gnome.system.proxy mode 2>/dev/null || echo "'none'")"
+    _GW_PREV_HTTP_HOST="$(gsettings get org.gnome.system.proxy.http host 2>/dev/null || echo "''")"
+    _GW_PREV_HTTP_PORT="$(gsettings get org.gnome.system.proxy.http port 2>/dev/null || echo "0")"
+    _GW_PREV_HTTPS_HOST="$(gsettings get org.gnome.system.proxy.https host 2>/dev/null || echo "''")"
+    _GW_PREV_HTTPS_PORT="$(gsettings get org.gnome.system.proxy.https port 2>/dev/null || echo "0")"
+    _GW_PREV_AUTOCONFIG_URL="$(gsettings get org.gnome.system.proxy autoconfig-url 2>/dev/null || echo "''")"
+    _GW_RESTORE_PROXY=1
+    trap _gw_restore_proxy EXIT INT TERM
     gsettings set org.gnome.system.proxy mode 'manual' 2>/dev/null || true
     gsettings set org.gnome.system.proxy.http host "$GATEWAY_HOST" 2>/dev/null || true
     gsettings set org.gnome.system.proxy.http port "$GATEWAY_PORT" 2>/dev/null || true
@@ -151,5 +183,11 @@ echo "[agentgateway] Command:    $@"
 echo "[agentgateway] LD_PRELOAD: ${LD_PRELOAD:-none}"
 echo "[agentgateway] ─────────────────────────────────"
 
-# Execute the wrapped command
-exec "$@"
+# Execute the wrapped command. We must NOT use `exec` here: the EXIT trap
+# (which restores the system proxy) only fires for the shell process, and
+# exec would replace it. Run the command, preserve its exit status, and let
+# the trap restore the proxy on exit.
+"$@"
+GW_EXIT=$?
+_gw_restore_proxy
+exit "$GW_EXIT"
