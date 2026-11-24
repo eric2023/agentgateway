@@ -826,22 +826,30 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         client = self.connection
-        sockets = [client, remote]
         try:
+            # Use poll() instead of select() — select() fails with
+            # "filedescriptor out of range" when FD numbers exceed 1024
+            # (common in long-running processes with many connections).
+            poller = select.poll()
+            poller.register(client, select.POLLIN | select.POLLERR | select.POLLHUP)
+            poller.register(remote, select.POLLIN | select.POLLERR | select.POLLHUP)
+            fd_to_sock = {client.fileno(): client, remote.fileno(): remote}
             while True:
-                readable, _, errored = select.select(sockets, [], sockets, 60)
-                if errored:
-                    break
-                if not readable:
+                events = poller.poll(60000)  # 60s timeout
+                if not events:
                     break  # timeout
-                for sock in readable:
-                    data = sock.recv(65536)
-                    if not data:
+                for fd, event in events:
+                    sock = fd_to_sock[fd]
+                    if event & (select.POLLERR | select.POLLHUP):
                         return
-                    if sock is client:
-                        remote.sendall(data)
-                    else:
-                        client.sendall(data)
+                    if event & select.POLLIN:
+                        data = sock.recv(65536)
+                        if not data:
+                            return
+                        if sock is client:
+                            remote.sendall(data)
+                        else:
+                            client.sendall(data)
         except (OSError, ssl.SSLError):
             pass
         finally:
