@@ -1,0 +1,13 @@
+[Unit]
+Description=AgentGateway BPF-LSM enforcement sandbox (方案B)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/agentgateway/bpf/agent_lsm
+Restart=on-failure
+Environment=AGW_ENFORCE_FILE_WRITE=0
+Environment=AGW_WRITE_ALLOW=/tmp
+
+[Install]
+WantedBy=multi-user.target

@@ -7,6 +7,10 @@ certs/ca-cert.pem
 # Logs
 logs/
 
+# DEB package output
+dist/
+packaging/debian/usr/
+
 # Audit data (runtime-generated, may contain sensitive content)
 audit/audit.jsonl
 audit/audit-tls.jsonl

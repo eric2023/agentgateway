@@ -1,0 +1,11 @@
+[Unit]
+Description=AgentGateway uprobe plaintext capture (SSL_write/gnutls_record_send)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/agentgateway/bpf/agent_uprobe
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

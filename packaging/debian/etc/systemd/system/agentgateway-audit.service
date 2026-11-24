@@ -1,0 +1,11 @@
+[Unit]
+Description=AgentGateway BPF audit consumer (ring buffer -> JSONL)
+After=agentgateway-lsm.service
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/agentgateway/bpf/audit_consumer /var/lib/agentgateway/audit.jsonl
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

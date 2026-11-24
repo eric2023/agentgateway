@@ -734,6 +734,38 @@ sudo ./bpf/seccomp_confirm --allow -- /bin/echo hi   # ALLOW：echo 正常输出
 
 > **关键发现**：本机 `socket_connect` LSM hook 的 `sockaddr` 是内核指针（`bpf_probe_read_user` 返回 `-EFAULT`），需用 `bpf_probe_read_kernel` 读取——与上游假设的 user 指针不同。
 
+### 6. DEB 打包与一键脚本
+
+**系统级安装（内核/CA/nftables/systemd）打包为 DEB**：
+
+```bash
+# 构建 DEB（编译 + 打包 → dist/agentgateway-bpf_1.0.0_amd64.deb）
+bash packaging/build_deb.sh
+
+# 安装（安装 CA 到 /etc/ssl/certs/、注册 5 个 systemd 服务、创建 /var/lib/agentgateway/）
+sudo dpkg -i dist/agentgateway-bpf_1.0.0_amd64.deb
+
+# 启动 / 卸载
+sudo systemctl start agentgateway-lsm agentgateway-audit   # 内核管控 + 审计
+sudo systemctl start agentgateway-tproxy                    # 透明代理（可选）
+sudo systemctl start agentgateway-uprobe agentgateway-uprobe-consumer  # 明文采集（可选）
+sudo dpkg -r agentgateway-bpf                               # 卸载（prerm 自动清理 CA/nftables/服务）
+```
+
+DEB 内容：BPF-LSM 程序与 loader、审计消费者、透明代理、uprobe 明文采集、seccomp 演示、CA 证书、5 个 systemd 单元（`agentgateway-{lsm,audit,tproxy,uprobe,uprobe-consumer}.service`）。
+
+**运行/配置合并为一键脚本** `run_agentgateway.sh`：
+
+```bash
+./run_agentgateway.sh build               # 编译 BPF 组件
+./run_agentgateway.sh deploy              # 加载 BPF-LSM + 审计消费者（自动 sudo）
+./run_agentgateway.sh deploy full         # 同上，另含透明代理 + uprobe
+./run_agentgateway.sh admit <name> <pid>  # 纳入 Agent 进程到受管 cgroup
+./run_agentgateway.sh verify              # P1/P4 验证
+./run_agentgateway.sh status              # 查看运行状态
+./run_agentgateway.sh stop                # 停止并清理（进程/nftables/pins）
+```
+
 ## 技术方案文档
 
 - [`specs/方案A_用户态验证_4.19内核.md`](specs/方案A_用户态验证_4.19内核.md) — 用户态拦截方案（当前实现，适用于 4.19 内核）

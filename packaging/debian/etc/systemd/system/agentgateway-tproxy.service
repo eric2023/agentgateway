@@ -1,0 +1,11 @@
+[Unit]
+Description=AgentGateway transparent proxy (system CA + nftables + SNI MITM)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/agentgateway/bpf/setup_transparent.sh
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

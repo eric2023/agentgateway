@@ -1,0 +1,24 @@
+#!/bin/sh
+# AgentGateway BPF 组件安装后脚本
+set -e
+
+AGW_DIR=/usr/lib/agentgateway
+DATA_DIR=/var/lib/agentgateway
+
+# 数据目录（审计日志）
+mkdir -p "$DATA_DIR"
+
+# 系统级 CA 安装（替代方案A的环境变量信任）
+install -m 644 "$AGW_DIR/certs/ca-cert.pem" /etc/ssl/certs/agentgateway-ca.pem
+update-ca-certificates || true
+
+# 注册 systemd 服务（enable 不 start，由一键脚本或显式 start 触发）
+systemctl daemon-reload || true
+systemctl enable agentgateway-lsm.service agentgateway-audit.service \
+    agentgateway-tproxy.service agentgateway-uprobe.service \
+    agentgateway-uprobe-consumer.service 2>/dev/null || true
+
+echo "AgentGateway BPF 组件已安装到 $AGW_DIR"
+echo "启动内核管控:  systemctl start agentgateway-lsm agentgateway-audit"
+echo "一键脚本:      $AGW_DIR/run_agentgateway.sh"
+exit 0
