@@ -1,4 +1,12 @@
 /*
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 Uniontech Software Technology Co., Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
  * AgentGateway LD_PRELOAD TLS Audit Shim
  * Hooks SSL_write/SSL_read (OpenSSL) and gnutls_record_send/gnutls_record_recv
  * (GnuTLS) to capture plaintext TLS traffic for audit purposes.

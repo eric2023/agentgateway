@@ -597,3 +597,12 @@ gsettings set org.gnome.system.proxy mode 'auto'
 
 - [`specs/方案A_用户态验证_4.19内核.md`](specs/方案A_用户态验证_4.19内核.md) — 用户态拦截方案（当前实现，适用于 4.19 内核）
 - [`specs/方案B_BPF-LSM内核级管控_6.6内核.md`](specs/方案B_BPF-LSM内核级管控_6.6内核.md) — 内核级 BPF-LSM 管控方案（适用于 6.6+ 内核）
+
+## 开源许可
+
+本项目基于 [Apache License 2.0](LICENSE) 开源。
+
+Copyright (c) 2026 Uniontech Software Technology Co., Ltd.
+
+除非适用法律要求或书面同意，根据许可证分发的软件按"原样"分发，
+不附带任何明示或暗示的担保或条件。详见许可证全文。
