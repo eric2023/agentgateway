@@ -1,24 +1,24 @@
 #!/bin/bash
-# start.sh — Start AgentGateway daemon + Dashboard in one shot.
+# start.sh — Start AgentGateway transparent proxy + Dashboard in one shot.
 #
 # Usage:
-#   ./start.sh          # start both (foreground, Ctrl+C to stop both)
-#   ./start.sh -d       # start in background (daemon mode)
-#   ./start.sh stop     # stop both
-#   ./start.sh restart  # restart both
-#
-# The gateway manages gsettings system proxy lifecycle (manual → restore on
-# exit).  The dashboard reads audit/audit.jsonl live and needs no restart.
+#   ./start.sh start      # start transparent proxy + dashboard (background)
+#   ./start.sh -d         # same as start (daemon mode)
+#   ./start.sh fg         # start in foreground (Ctrl+C to stop both)
+#   ./start.sh stop       # stop both
+#   ./start.sh restart    # restart both
+#   ./start.sh status     # show running status
+#   ./start.sh setup      # one-time root setup (iptables + cgroup + CA)
 
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GATEWAY="$PROJECT_DIR/gateway/agentgatewayd.py"
+TPROXY="$PROJECT_DIR/gateway/transparent_proxy.py"
 DASHBOARD="$PROJECT_DIR/dashboard/dashboard.py"
 LOG_DIR="$PROJECT_DIR/logs"
-GATEWAY_LOG="$LOG_DIR/gateway.log"
+TPROXY_LOG="$LOG_DIR/tproxy.log"
 DASHBOARD_LOG="$LOG_DIR/dashboard.log"
-GATEWAY_PIDFILE="$LOG_DIR/gateway.pid"
+TPROXY_PIDFILE="$LOG_DIR/tproxy.pid"
 DASHBOARD_PIDFILE="$LOG_DIR/dashboard.pid"
 
 PYTHON="$(command -v python3 || true)"
@@ -72,7 +72,7 @@ start_proc() {
 # ─── actions ────────────────────────────────────────────────────────────────
 
 do_stop() {
-    stop_proc "gateway"  "$GATEWAY_PIDFILE"
+    stop_proc "transparent-proxy" "$TPROXY_PIDFILE"
     stop_proc "dashboard" "$DASHBOARD_PIDFILE"
 }
 
@@ -80,17 +80,17 @@ do_start() {
     # Stop existing instances first (clean restart).
     do_stop 2>/dev/null || true
 
-    start_proc "gateway"   "$GATEWAY"   "$GATEWAY_PIDFILE"   "$GATEWAY_LOG"
-    sleep 1.5   # let gateway bind the port + set gsettings before dashboard
-    start_proc "dashboard" "$DASHBOARD" "$DASHBOARD_PIDFILE" "$DASHBOARD_LOG"
+    start_proc "transparent-proxy" "$TPROXY"   "$TPROXY_PIDFILE"   "$TPROXY_LOG"
+    sleep 1.5   # let tproxy bind the port before dashboard
+    start_proc "dashboard"         "$DASHBOARD" "$DASHBOARD_PIDFILE" "$DASHBOARD_LOG"
 
     echo
     echo "[start.sh] ─────────────────────────────────────"
-    echo "[start.sh] Gateway:   http://127.0.0.1:8443  (proxy)"
-    echo "[start.sh] Dashboard: http://127.0.0.1:9090  (web UI)"
-    echo "[start.sh] Logs:      $GATEWAY_LOG"
-    echo "[start.sh]             $DASHBOARD_LOG"
-    echo "[start.sh] Stop:       $0 stop"
+    echo "[start.sh] Transparent proxy: 127.0.0.1:8444"
+    echo "[start.sh] Dashboard:         http://127.0.0.1:9090"
+    echo "[start.sh] Logs:  $TPROXY_LOG"
+    echo "[start.sh]        $DASHBOARD_LOG"
+    echo "[start.sh] Stop:  $0 stop"
     echo "[start.sh] ─────────────────────────────────────"
 }
 
@@ -98,34 +98,33 @@ do_foreground() {
     # Stop any background instances.
     do_stop 2>/dev/null || true
 
-    echo "[start.sh] Starting gateway (foreground) ..."
-    "$PYTHON" "$GATEWAY" >>"$GATEWAY_LOG" 2>&1 &
-    GW_PID=$!
-    echo "$GW_PID" > "$GATEWAY_PIDFILE"
-    echo "[start.sh] Gateway pid=$GW_PID"
+    echo "[start.sh] Starting transparent proxy (foreground) ..."
+    "$PYTHON" "$TPROXY" >>"$TPROXY_LOG" 2>&1 &
+    TP_PID=$!
+    echo "$TP_PID" > "$TPROXY_PIDFILE"
+    echo "[start.sh] Transparent proxy pid=$TP_PID"
 
     sleep 1.5
 
     echo "[start.sh] Starting dashboard (foreground) ..."
     "$PYTHON" "$DASHBOARD" >>"$DASHBOARD_LOG" 2>&1 &
     DASH_PID=$!
-    echo "$DASHBOARD_PIDFILE" > /dev/null
     echo "$DASH_PID" > "$DASHBOARD_PIDFILE"
     echo "[start.sh] Dashboard pid=$DASH_PID"
 
     echo
-    echo "[start.sh] Gateway:   http://127.0.0.1:8443  (proxy)"
-    echo "[start.sh] Dashboard: http://127.0.0.1:9090  (web UI)"
+    echo "[start.sh] Transparent proxy: 127.0.0.1:8444"
+    echo "[start.sh] Dashboard:         http://127.0.0.1:9090"
     echo "[start.sh] Press Ctrl+C to stop both."
     echo
 
     cleanup() {
         echo
         echo "[start.sh] Stopping ..."
-        kill "$GW_PID" 2>/dev/null || true
+        kill "$TP_PID" 2>/dev/null || true
         kill "$DASH_PID" 2>/dev/null || true
-        rm -f "$GATEWAY_PIDFILE" "$DASHBOARD_PIDFILE"
-        wait "$GW_PID" 2>/dev/null || true
+        rm -f "$TPROXY_PIDFILE" "$DASHBOARD_PIDFILE"
+        wait "$TP_PID" 2>/dev/null || true
         wait "$DASH_PID" 2>/dev/null || true
         echo "[start.sh] Stopped."
     }
@@ -135,16 +134,21 @@ do_foreground() {
 }
 
 do_status() {
-    if is_running "$GATEWAY_PIDFILE"; then
-        echo "[start.sh] Gateway:   running (pid=$(cat "$GATEWAY_PIDFILE"))"
+    if is_running "$TPROXY_PIDFILE"; then
+        echo "[start.sh] Transparent proxy: running (pid=$(cat "$TPROXY_PIDFILE"))"
     else
-        echo "[start.sh] Gateway:   stopped"
+        echo "[start.sh] Transparent proxy: stopped"
     fi
     if is_running "$DASHBOARD_PIDFILE"; then
         echo "[start.sh] Dashboard: running (pid=$(cat "$DASHBOARD_PIDFILE"))"
     else
         echo "[start.sh] Dashboard: stopped"
     fi
+}
+
+do_setup() {
+    echo "[start.sh] Running one-time root setup..."
+    sudo bash "$PROJECT_DIR/setup_iptables.sh"
 }
 
 # ─── main ───────────────────────────────────────────────────────────────────
@@ -156,15 +160,17 @@ case "${1:-start}" in
     stop)    do_stop ;;
     restart) do_start ;;
     status)  do_status ;;
+    setup)   do_setup ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|fg}"
+        echo "Usage: $0 {start|stop|restart|status|fg|setup}"
         echo
-        echo "  start    Start gateway + dashboard in background (default)"
+        echo "  start    Start transparent proxy + dashboard (default)"
         echo "  -d       Same as start (daemon mode)"
         echo "  fg       Start in foreground (Ctrl+C to stop both)"
         echo "  stop     Stop both"
         echo "  restart  Restart both"
         echo "  status   Show running status"
+        echo "  setup    One-time root setup (iptables + cgroup + CA)"
         exit 1
         ;;
 esac
