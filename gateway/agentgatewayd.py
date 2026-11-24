@@ -31,6 +31,9 @@ import uuid
 import socket
 import select
 import threading
+import signal
+import atexit
+import subprocess
 import http.server
 import socketserver
 import urllib.parse
@@ -554,7 +557,6 @@ def _lookup_peer_process(client_socket):
 
     if not inode:
         return None, None, None
-
     target_link = f"socket:[{inode}]"
 
     # Scan /proc/*/fd/ to find which PID owns this socket.
@@ -1449,13 +1451,91 @@ def make_handler_with_session(agent_id, session_id, app_name="unknown"):
     return SessionInjectedHandler
 
 
+# ─── System Proxy Management (gsettings) ─────────────────────────────────────
+# The gateway must set DDE's system proxy to 'manual' so that apps which read
+# gsettings (UOS AI, hermes, etc.) route through the gateway.  Previously
+# trustexec.sh did this, but trustexec exits immediately when the wrapped
+# command daemonizes (e.g. hermes), restoring the proxy while the daemon is
+# still running.  Moving the lifecycle to the gateway process itself ensures
+# the proxy stays 'manual' for as long as the gateway is alive.
+
+_GW_PROXY_RESTORE = None  # dict of snapshot values, or None if not set
+
+_GSETTINGS_KEYS = [
+    ("mode",           "org.gnome.system.proxy",       "mode"),
+    ("http_host",      "org.gnome.system.proxy.http",  "host"),
+    ("http_port",      "org.gnome.system.proxy.http",  "port"),
+    ("https_host",     "org.gnome.system.proxy.https", "host"),
+    ("https_port",     "org.gnome.system.proxy.https", "port"),
+    ("autoconfig_url", "org.gnome.system.proxy",       "autoconfig-url"),
+]
+
+
+def _gsettings_get(schema, key):
+    """Read a gsettings value, returning the raw gsettings variant string."""
+    try:
+        r = subprocess.run(
+            ["gsettings", "get", schema, key],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _gsettings_set(schema, key, value):
+    """Write a gsettings value. *value* is the bare string (not quoted)."""
+    try:
+        subprocess.run(
+            ["gsettings", "set", schema, key, value],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def gw_proxy_setup():
+    """Snapshot current system proxy settings and force 'manual' → gateway."""
+    global _GW_PROXY_RESTORE
+    if _GW_PROXY_RESTORE is not None:
+        return  # already set up
+    snap = {}
+    for name, schema, key in _GSETTINGS_KEYS:
+        snap[name] = _gsettings_get(schema, key)
+    _GW_PROXY_RESTORE = snap
+    _gsettings_set("org.gnome.system.proxy", "mode", "'manual'")
+    _gsettings_set("org.gnome.system.proxy.http", "host", f"'{GATEWAY_HOST}'")
+    _gsettings_set("org.gnome.system.proxy.http", "port", str(GATEWAY_PORT))
+    _gsettings_set("org.gnome.system.proxy.https", "host", f"'{GATEWAY_HOST}'")
+    _gsettings_set("org.gnome.system.proxy.https", "port", str(GATEWAY_PORT))
+    _gsettings_set("org.gnome.system.proxy", "autoconfig-url", "''")
+    log(f"[PROXY] System proxy set to manual → {GATEWAY_HOST}:{GATEWAY_PORT}")
+
+
+def gw_proxy_restore():
+    """Restore system proxy settings to their pre-gateway values."""
+    global _GW_PROXY_RESTORE
+    if _GW_PROXY_RESTORE is None:
+        return
+    snap = _GW_PROXY_RESTORE
+    for name, schema, key in _GSETTINGS_KEYS:
+        val = snap.get(name)
+        if val is not None:
+            _gsettings_set(schema, key, val)
+    _GW_PROXY_RESTORE = None
+    log("[PROXY] System proxy restored")
+
 def main():
     os.makedirs(AUDIT_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(CERT_DIR, exist_ok=True)
 
     audit_init()
-    load_ca()
+    gw_proxy_setup()
+    atexit.register(gw_proxy_restore)
+    signal.signal(signal.SIGTERM, lambda *_: (gw_proxy_restore(), sys.exit(0)))
 
     # Default session for standalone testing
     agent_id = os.environ.get("AGENTGATEWAY_AGENT_ID", f"agent-{uuid.uuid4().hex[:8]}")
