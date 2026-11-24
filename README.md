@@ -629,28 +629,107 @@ gsettings set org.gnome.system.proxy mode 'auto'
 
 > **环境限制**：本机内核未编译 Landlock（`CONFIG_SECURITY_LANDLOCK=n`），文件边界改用 BPF-LSM `file_open` 实现（spec 的主机制）。
 
-### 构建与部署
+### 1. 前置条件
+
+| 依赖 | 要求 | 检查 |
+|------|------|------|
+| 内核 | 6.6，`bpf` LSM 激活 | `cat /sys/kernel/security/lsm \| grep bpf` |
+| BTF | `/sys/kernel/btf/vmlinux` | `ls /sys/kernel/btf/vmlinux` |
+| 工具链 | clang-17 + bpftool + libbpf-dev | `make -C bpf all` |
+| 权限 | root（`CAP_BPF + CAP_SYS_ADMIN`） | 加载时用 `sudo` |
+| gcc / make | 编译 loader 与辅助程序 | 系统自带 |
+
+> 本机 `kernel.unprivileged_bpf_disabled=2`，非 root 无法执行任何 `bpf()` 系统调用（这也是方案 B 自保护的第一道防线）。
+
+### 2. 编译（userspace 免 root）
+
+工具链（clang-17 / bpftool / libbpf-dev）不安装到系统，而是解压到本地前缀 `~/agentgateway-toolchain`（`bpf/Makefile` 的 `PREFIX` 变量指向它）：
 
 ```bash
-# 1. 工具链（clang-17 / bpftool / libbpf-dev，userspace 免 root 编译，已解压到 ~/agentgateway-toolchain）
-make -C bpf all
+# 2.1 准备工具链（一次性；运行时库 libllvm17/libclang-* 系统已带，仅需 5 个包）
+mkdir -p ~/agentgateway-toolchain /tmp/agw-debs && cd /tmp/agw-debs
+for p in clang-17 libclang-common-17-dev libbpf-dev bpftool libpfm4; do
+    dpkg -s "$p" >/dev/null 2>&1 || apt-get download "$p" >/dev/null 2>&1
+done
+for d in *.deb; do dpkg -x "$d" ~/agentgateway-toolchain/; done
 
-# 2. 加载 BPF-LSM（需 root）
-sudo ./bpf/agent_lsm &                        # socket_connect / file_open / bpf 管控
+# 2.2 生成 vmlinux.h（从内核 BTF 自动生成）+ 编译全部程序
+cd agentgateway
+make -C bpf all
+```
+
+`make -C bpf all` 产出：
+
+| 产物 | 用途 |
+|------|------|
+| `bpf/agent_lsm` | BPF-LSM loader（socket_connect/file_open/bprm_check/bpf 四个 hook） |
+| `bpf/audit_consumer` | ring buffer → `audit/audit.jsonl` |
+| `bpf/agent_admit` | 创建 cgroup + 写 identity_map + 移动 PID（纳入 Agent） |
+| `bpf/agent_landlock` | Landlock 文件边界辅助（本机内核未编译 Landlock，备用） |
+| `bpf/agent_uprobe` / `agent_uprobe_consumer` | uprobe 明文采集 + 消费者 |
+| `bpf/seccomp_confirm` | seccomp USER_NOTIF 同步确认演示 |
+| `bpf/cgroupid` | 打印 cgroup id（诊断） |
+
+### 3. 部署（需 root）
+
+```bash
+cd agentgateway
+
+# 3.1 生成 CA（首次；certs/ca-key.pem 为运行时产物，勿提交）
+python3 gateway/gen_ca.py
+
+# 3.2 加载 BPF-LSM 并启动审计消费者
+sudo ./bpf/agent_lsm &                        # socket_connect / file_open / bpf 内核管控
 sudo ./bpf/audit_consumer audit/audit.jsonl & # ring buffer → JSONL
 
-# 3. 纳入 Agent（cgroup 身份 + 文件边界）
+# 3.3 透明代理：系统级 CA + nftables redirect + 透明监听（复用网关 L7）
+sudo ./bpf/setup_transparent.sh               # 前台运行，:8444
+```
+
+`setup_transparent.sh` 依次：`install` CA 到 `/etc/ssl/certs/` → `update-ca-certificates` → nftables `redirect`（非 root 的 `:443` → `:8444`，排除网关自身的 root 转发避免环路）→ 启动 `gateway/transparent_proxy.py`。
+
+若不想用透明代理，仅需 `HTTPS_PROXY` 走 8443 的 CONNECT 代理（方案 A 路径），则跳过 3.3。
+
+### 4. 运行与纳入 Agent
+
+```bash
+# 4.1 纳入 Agent（cgroup 身份 + 不可篡改身份映射）
+#    <pid> 为 Agent 进程 PID；此后该进程及其子进程受 BPF-LSM 管控
 sudo ./bpf/agent_admit <name> <agent-id> <session-id> <app> <pid>
 
-# 4. 透明代理（可选：nftables 强制重定向，无需 HTTPS_PROXY）
-sudo ./bpf/setup_transparent.sh
+# 4.2 或通过 trustexec 包装器（自动建 cgroup + 写身份 + Landlock 辅助）
+./trustexec.sh --app "OMP" --bpf /path/to/omp
 
-# 5. 明文采集（可选：内核态 uprobe）
+# 4.3 可选：内核态明文采集（uprobe）
 sudo ./bpf/agent_uprobe &
 sudo ./bpf/agent_uprobe_consumer audit/audit-tls.jsonl &
+```
 
-# 验证 P1 DENY 闭环
-sudo bash bpf/verify_p1.sh
+### 5. 逐项验证
+
+```bash
+# P1 网络强制：受管进程直连 443 → 内核内 DENY
+sudo bash bpf/verify_p1.sh                     # 期望 audit.jsonl 出现 decision=DENY
+
+# P2 文件边界：写白名单目录 OK，写其他目录 -EPERM
+sudo env AGW_ENFORCE_FILE_WRITE=1 AGW_WRITE_ALLOW=/tmp/sandbox ./bpf/agent_lsm &
+#   受管进程：echo ok > /tmp/sandbox/a.txt 成功；echo x > /tmp/other/b.txt 报 Operation not permitted
+
+# P3 透明代理：非 root curl 无 HTTPS_PROXY 直连 AI 主机，被 redirect 后 MITM 审计
+curl --cacert certs/ca-cert.pem -X POST https://api.openai.com/v1/chat/completions \
+  -H 'Content-Type: application/json' -H 'Authorization: Bearer test-key' \
+  -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#   期望 audit.jsonl 出现 ai_request_audited（host=api.openai.com）
+
+# P3 明文采集：任意 libssl 进程发起 HTTPS，uprobe 捕获加密前明文
+curl -sS https://deb.debian.org/              # 期望 audit/audit-tls.jsonl 出现 tls_plaintext
+
+# P4 seccomp 同步确认：execve 被 trap，notifier 同步 DENY/ALLOW
+sudo ./bpf/seccomp_confirm -- /bin/echo hi     # DENY：exec 被阻断，exit=1
+sudo ./bpf/seccomp_confirm --allow -- /bin/echo hi   # ALLOW：echo 正常输出
+
+# P5 自保护：受管进程（含 root）执行 bpf() 被内核拒绝
+#   将某个 shell 纳入 cgroup 后执行 bpftool prog list → Operation not permitted
 ```
 
 > **关键发现**：本机 `socket_connect` LSM hook 的 `sockaddr` 是内核指针（`bpf_probe_read_user` 返回 `-EFAULT`），需用 `bpf_probe_read_kernel` 读取——与上游假设的 user 指针不同。
