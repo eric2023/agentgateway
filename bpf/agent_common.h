@@ -61,6 +61,20 @@ struct agent_config {
     char write_allow_dir[256];  /* allowed write dir prefix (global, v1) */
 };
 
+/* TLS plaintext capture event (uprobe ring buffer) */
+#define TLS_CAPTURE_MAX 256
+
+struct tls_event {
+    __u64 ts_ns;
+    __u32 pid;
+    __u32 tgid;
+    __u64 cgroup_id;
+    __u32 len;
+    __u8  dir;        /* 0 = outbound (SSL_write/gnutls_record_send) */
+    __u8  pad[3];
+    char  data[TLS_CAPTURE_MAX];
+};
+
 /* ring-buffer audit event (audit_buf) */
 #define AGW_PATH_MAXLEN 256
 

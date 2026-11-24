@@ -16,7 +16,8 @@ BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_x86 $(INCLUDES)
 LIBDIR   := $(PREFIX)/usr/lib/x86_64-linux-gnu
 LDFLAGS  := -L$(LIBDIR) -lbpf -lelf -lz
 
-all: agent_lsm.bpf.o agent_lsm.skel.h agent_lsm audit_consumer cgroupid agent_admit agent_landlock
+all: agent_lsm.bpf.o agent_lsm.skel.h agent_lsm audit_consumer cgroupid agent_admit agent_landlock \
+     agent_uprobe.bpf.o agent_uprobe.skel.h agent_uprobe agent_uprobe_consumer
 
 vmlinux.h:
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
@@ -42,7 +43,20 @@ agent_admit: agent_admit.c agent_common.h
 agent_landlock: agent_landlock.c
 	$(CC) -g -Wall -O2 $< -o $@
 
+agent_uprobe.bpf.o: agent_uprobe.bpf.c agent_common.h vmlinux.h
+	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+
+agent_uprobe.skel.h: agent_uprobe.bpf.o
+	$(BPFTOOL) gen skeleton $< > $@
+
+agent_uprobe: agent_uprobe.c agent_uprobe.skel.h
+	$(CC) -g -Wall -O2 $(INCLUDES) $< -o $@ $(LDFLAGS)
+
+agent_uprobe_consumer: agent_uprobe_consumer.c agent_common.h
+	$(CC) -g -Wall -O2 $(INCLUDES) $< -o $@ $(LDFLAGS)
+
 clean:
-	rm -f *.o *.skel.h agent_lsm audit_consumer cgroupid agent_admit agent_landlock
+	rm -f *.o *.skel.h agent_lsm audit_consumer cgroupid agent_admit agent_landlock \
+	      agent_uprobe agent_uprobe_consumer
 
 .PHONY: all clean

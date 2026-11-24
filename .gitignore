@@ -9,6 +9,7 @@ logs/
 
 # Audit data (runtime-generated, may contain sensitive content)
 audit/audit.jsonl
+audit/audit-tls.jsonl
 audit/test_report.md
 
 # Compiled artifacts (rebuilt from source)
@@ -25,6 +26,8 @@ bpf/audit_consumer
 bpf/cgroupid
 bpf/agent_admit
 bpf/agent_landlock
+bpf/agent_uprobe
+bpf/agent_uprobe_consumer
 
 # OS files
 .DS_Store
