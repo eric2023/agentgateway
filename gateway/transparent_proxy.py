@@ -2,22 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Uniontech Software Technology Co., Ltd.
 #
-# AgentGateway transparent proxy (方案 B, P3).
+# AgentGateway transparent proxy (方案 A).
 #
-# Accepts nftables-REDIRECTed local :443 traffic, extracts the SNI hostname from
-# the TLS ClientHello, MITMs AI hosts (reusing agentgatewayd's CA/L7/audit), and
-# blind-tunnels everything else. Runs on its own port (:8444) so the existing
-# CONNECT proxy (:8443, 方案 A) is untouched.
+# Accepts iptables-REDIRECTed :443 traffic from cgroup-isolated Agent
+# processes, extracts the SNI hostname from the TLS ClientHello, MITMs
+# all connections (reusing agentgatewayd's CA/L7/audit/connection pool).
+# Runs on :8444.
 #
-# nftables (root), redirecting non-root :443 -> :8444 (excludes the gateway's
-# own outbound forwarding, which runs as root):
-#   nft add table inet agentgateway
-#   nft add chain inet agentgateway output '{ type nat hook output priority -100; policy accept; }'
-#   nft add rule inet agentgateway output meta skuid != 0 tcp dport 443 redirect to :8444
+# iptables-legacy (root), redirecting cgroup 0x100001 :443 -> :8444:
+#   /usr/sbin/iptables-legacy -t nat -A OUTPUT \
+#     -p tcp --dport 443 -m cgroup --cgroup 0x100001 \
+#     -j REDIRECT --to-port 8444
+#
+# All traffic reaching this proxy is from cgroup-isolated Agent processes,
+# so every connection is MITM'd — no AI_HOST_PATTERNS filtering needed.
 
 import os
 import sys
 import socket
+import select
 import ssl
 import struct
 import threading
@@ -149,49 +152,104 @@ def _read_request(rfile):
 
 
 def _forward(host, port, method, path, headers, body):
-    """Forward the request upstream over a fresh TLS connection (CERT_NONE)."""
-    sock = socket.create_connection((host, port), timeout=30)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    usock = ctx.wrap_socket(sock, server_hostname=host)
-
-    req = f"{method} {path} HTTP/1.1\r\n".encode()
-    for k, v in headers.items():
-        if k.lower() in ("proxy-connection", "proxy-authorization"):
-            continue
-        req += f"{k}: {v}\r\n".encode()
-    req += b"Connection: close\r\n\r\n" + body
-    usock.sendall(req)
-
-    data = b""
-    while True:
-        chunk = usock.recv(65536)
-        if not chunk:
-            break
-        data += chunk
-    usock.close()
-
-    hdr_end = data.find(b"\r\n\r\n")
-    if hdr_end == -1:
-        return 502, [], b"", b""
-    head = data[:hdr_end].decode("utf-8", errors="replace")
-    body_bytes = data[hdr_end + 4:]
-    lines = head.split("\r\n")
+    """Forward request upstream using pooled TLS connection."""
+    sock, is_reused = gw._get_upstream_socket(host, port)
     try:
-        status = int(lines[0].split(" ", 2)[1])
+        return _do_forward(host, port, sock, method, path, headers, body)
+    except (socket.timeout, ConnectionError, ssl.SSLError, OSError) as e:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        if not is_reused:
+            raise
+        gw.log(f"[POOL] Retrying {host}:{port} with fresh connection after: {e}")
+        sock, _ = gw._get_upstream_socket(host, port)
+        return _do_forward(host, port, sock, method, path, headers, body)
+
+
+def _do_forward(host, port, sock, method, path, headers, body):
+    """Send request on sock, read response, return socket to pool."""
+    req = f"{method} {path} HTTP/1.1\r\n".encode("utf-8")
+    for k, v in headers.items():
+        if k.lower() in ("proxy-connection", "proxy-authorization", "connection"):
+            continue
+        req += f"{k}: {v}\r\n".encode("utf-8")
+    req += b"Connection: keep-alive\r\n\r\n"
+    req += body
+
+    sock.sendall(req)
+
+    resp_buf = b""
+    while b"\r\n\r\n" not in resp_buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise ConnectionError("upstream closed before headers")
+        resp_buf += chunk
+
+    hdr_end = resp_buf.find(b"\r\n\r\n")
+    header_block = resp_buf[:hdr_end].decode("utf-8", errors="replace")
+    body_data = resp_buf[hdr_end + 4:]
+
+    lines = header_block.split("\r\n")
+    try:
+        _, status_str, _ = lines[0].split(" ", 2)
+        status = int(status_str)
     except (IndexError, ValueError):
         status = 502
+
     resp_headers = []
     for line in lines[1:]:
         if ":" in line:
             k, v = line.split(":", 1)
             resp_headers.append((k.strip(), v.strip()))
+
+    content_length = None
+    is_chunked = False
+    connection_close = False
     for k, v in resp_headers:
-        if k.lower() == "transfer-encoding" and "chunked" in v.lower():
-            body_bytes = _dechunk(body_bytes)
-            break
-    return status, resp_headers, body_bytes, data
+        kl = k.lower()
+        if kl == "content-length":
+            try:
+                content_length = int(v)
+            except ValueError:
+                pass
+        elif kl == "transfer-encoding" and "chunked" in v.lower():
+            is_chunked = True
+        elif kl == "connection" and "close" in v.lower():
+            connection_close = True
+
+    if is_chunked:
+        terminator = b"0\r\n\r\n"
+        while not body_data.endswith(terminator):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            body_data += chunk
+        body_data = gw._dechunk(body_data)
+    elif content_length is not None:
+        while len(body_data) < content_length:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            body_data += chunk
+    else:
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            body_data += chunk
+        connection_close = True
+
+    if connection_close:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    else:
+        gw._return_upstream_socket(host, port, sock)
+
+    return status, resp_headers, body_data
 
 
 def _blind_tunnel(client, host, port, initial=b""):
@@ -203,19 +261,28 @@ def _blind_tunnel(client, host, port, initial=b""):
     try:
         if initial:
             remote.sendall(initial)
-        socks = [client, remote]
+        # Use poll() — select() fails with "filedescriptor out of range"
+        # when FD numbers exceed 1024 (common in long-running processes).
+        poller = select.poll()
+        poller.register(client, select.POLLIN | select.POLLERR | select.POLLHUP)
+        poller.register(remote, select.POLLIN | select.POLLERR | select.POLLHUP)
+        fd_to_sock = {client.fileno(): client, remote.fileno(): remote}
         while True:
-            r, _, _ = _select(socks, [], socks, 60)
-            if not r:
+            events = poller.poll(60000)
+            if not events:
                 break
-            for s in r:
-                d = s.recv(65536)
-                if not d:
+            for fd, event in events:
+                sock = fd_to_sock[fd]
+                if event & (select.POLLERR | select.POLLHUP):
                     return
-                if s is client:
-                    remote.sendall(d)
-                else:
-                    client.sendall(d)
+                if event & select.POLLIN:
+                    data = sock.recv(65536)
+                    if not data:
+                        return
+                    if sock is client:
+                        remote.sendall(data)
+                    else:
+                        client.sendall(data)
     except (OSError, ssl.SSLError):
         pass
     finally:
@@ -223,12 +290,6 @@ def _blind_tunnel(client, host, port, initial=b""):
             remote.close()
         except OSError:
             pass
-
-
-def _select(rlist, wlist, xlist, timeout):
-    import select
-    return select.select(rlist, wlist, xlist, timeout)
-
 
 def _mitm(client, host, rfile_hint=b""):
     cert_path, key_path = gw.generate_cert_for_host(host)
@@ -255,7 +316,7 @@ def _mitm(client, host, rfile_hint=b""):
         resp_body = b""
         fwd_ok = True
         try:
-            status, resp_headers, resp_body, _raw = _forward(host, 443, method, path, headers, body)
+            status, resp_headers, resp_body = _forward(host, 443, method, path, headers, body)
         except Exception as e:
             fwd_ok = False
             gw.log(f"[TPROXY] forward {host}{path} failed: {e}")
@@ -330,11 +391,9 @@ def _handle(client, addr):
                 client.recv(4096)  # consume the peeked bytes' copy is fine; we peeked so still buffered
                 _blind_tunnel(client, orig_ip, orig_port)
             return
-        if gw._should_mitm(sni):
-            gw.log(f"[TPROXY] MITM {sni} from {addr[0]}:{addr[1]}")
-            _mitm(client, sni)
-        else:
-            _blind_tunnel(client, sni, 443)
+        # All cgroup-isolated traffic is MITM'd — no host filtering needed.
+        gw.log(f"[TPROXY] MITM {sni} from {addr[0]}:{addr[1]}")
+        _mitm(client, sni)
     except (OSError, ssl.SSLError):
         pass
     finally:
