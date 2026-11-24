@@ -69,18 +69,29 @@ agentgateway/
 
 ## 环境要求
 
-| 依赖 | 版本 | 说明 |
-|------|------|------|
-| Python | ≥ 3.8 | 网关 + 仪表盘 |
-| cryptography | ≥ 2.6 | 证书生成 / TLS |
-| gcc | 任意 | 编译 `libauditshim.so`（可选） |
-| OpenSSL libssl | 系统自带 | `libauditshim` 链接依赖 |
+| 依赖 | 版本 | 说明 | 必需 |
+|------|------|------|------|
+| Python | ≥ 3.8 | 网关 + 仪表盘 | ✅ |
+| cryptography | ≥ 2.6 | 证书生成 / TLS（`pip install cryptography`） | ✅ |
+| gcc | 任意 | 编译 `libauditshim.so`（辅助 Qt5 TLS 绕过） | ⬜ 可选 |
+| OpenSSL libssl | 系统自带 | `libauditshim` 链接依赖（仅编译垫片时） | ⬜ 可选 |
+| certutil (nss-tools) | 任意 | 导入 CA 到浏览器 NSS 库 | ⬜ 可选 |
 
 > 无需 root 权限。所有操作在用户空间完成。
 
+**一键检查依赖**：
+
+```bash
+cd agentgateway
+python3 -c "import cryptography; print('cryptography', cryptography.__version__)" \
+  && command -v gcc && echo "gcc OK" || echo "gcc missing (垫片可选)"
+```
+
 ## 部署
 
-### 1. 生成 CA 证书
+按顺序执行以下三步完成部署。首次部署约 30 秒。
+
+### 1. 生成 CA 证书（首次）
 
 ```bash
 cd agentgateway
@@ -92,10 +103,12 @@ python3 gateway/gen_ca.py
 - `certs/ca-key.pem` — 根 CA 私钥（权限 600）
 
 **原理**：网关在 MITM TLS 时使用此 CA 动态签发目标主机的临时证书。目标应用必须信任此 CA 才能建立 TLS 连接。信任方式取决于应用类型：
-- OpenSSL/Python 应用 → `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE`
-- Node/Electron 应用 → `NODE_EXTRA_CA_CERTS`
-- Qt5 应用 → `LD_PRELOAD` 钩取 `X509_verify_cert` 绕过验证
-- Chromium 浏览器 → 导入 NSS 证书库
+- OpenSSL/Python 应用 → `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE`（trustexec.sh 自动设置）
+- Node/Electron 应用 → `NODE_EXTRA_CA_CERTS`（trustexec.sh 自动设置）
+- Qt5 应用 → `LD_PRELOAD` 钩取 `X509_verify_cert` 绕过验证（需编译垫片）
+- Chromium 浏览器 → 导入 NSS 证书库（见步骤 3）
+
+> 已有证书可跳过此步。重新生成会使已签发的动态证书失效，需重启网关。
 
 ### 2. 编译审计垫片（可选但推荐）
 
@@ -103,6 +116,8 @@ python3 gateway/gen_ca.py
 cd agentgateway
 gcc -shared -fPIC -o gateway/libauditshim.so gateway/libauditshim.c -ldl
 ```
+
+> 现代 glibc（2.34+）已将 pthread 合入 libc，`-ldl` 即可。旧系统若链接失败，追加 `-lpthread`。
 
 **`libauditshim.so` 的作用**：通过 `LD_PRELOAD` 注入目标进程，实现两个功能：
 
@@ -118,7 +133,7 @@ gcc -shared -fPIC -o gateway/libauditshim.so gateway/libauditshim.c -ldl
 
 审计数据通过 Unix socket `/tmp/agentgateway-audit.sock` 发送（非阻塞，best-effort，不影响应用性能）。
 
-> 编译可选。仅通过 `HTTPS_PROXY` 即可完成拦截；垫片用于辅助绕过 Qt5 应用的 TLS 验证和捕获明文。
+> 编译可选。仅通过 `HTTPS_PROXY` 即可完成拦截；垫片用于辅助绕过 Qt5 应用的 TLS 验证和捕获明文。Qt5 应用（如 UOS AI）不编译垫片则 TLS 握手失败。
 
 ### 3. 安装 CA 证书到浏览器（可选）
 
@@ -134,19 +149,40 @@ export SSL_CERT_FILE=$(pwd)/certs/ca-cert.pem
 export NODE_EXTRA_CA_CERTS=$(pwd)/certs/ca-cert.pem
 ```
 
+> omp、UOS AI、命令行工具（curl/python）不需要此步——trustexec.sh 会注入所需的环境变量。
+
 ## 运行
 
 ### 启动网关 + 仪表盘
 
 ```bash
 cd agentgateway
+mkdir -p logs
 
 # 启动网关（MITM 代理，端口 8443）
 python3 gateway/agentgatewayd.py > logs/gateway.log 2>&1 &
 
 # 启动仪表盘（Web UI，端口 9090）
 python3 dashboard/dashboard.py > logs/dashboard.log 2>&1 &
+
+# 等待启动并验证端口监听
+sleep 2 && ss -tlnp | grep -E '8443|9090'
 ```
+
+启动成功标志：
+- 网关日志输出 `AgentGateway started`，监听 `127.0.0.1:8443`
+- 仪表盘日志输出 `URL: http://127.0.0.1:9090`，监听 `127.0.0.1:9090`
+- 浏览器打开 `http://127.0.0.1:9090` 显示仪表盘页面
+
+**故障排查**：
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| `Address already in use` | 端口被占用 | `fuser -k 8443/tcp; fuser -k 9090/tcp` |
+| `No module named 'cryptography'` | 缺少依赖 | `pip install cryptography` |
+| 仪表盘页面空白 | 网关未启动 / 审计日志为空 | 先启动网关，发送一个测试请求 |
+| Agent TLS 报错 | 未信任 CA | 确认通过 trustexec.sh 启动（自动注入 CA） |
+| Qt5 应用 TLS 失败 | 未编译垫片 | 执行部署步骤 2 编译 `libauditshim.so` |
 
 ### 通过 trustexec.sh 启动 Agent
 
@@ -165,6 +201,23 @@ python3 dashboard/dashboard.py > logs/dashboard.log 2>&1 &
 # 示例：启动 omp（需要先退出现有会话，见下文）
 ./trustexec.sh --app "OMP" /home/ut000520@uos/.local/bin/omp
 ```
+
+### 验证拦截
+
+启动网关后，发送一个测试请求确认拦截链路正常：
+
+```bash
+cd agentgateway
+curl -s -x http://127.0.0.1:8443 \
+  --cacert certs/ca-cert.pem \
+  -X POST https://ai.uniontech.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer test-key" \
+  -d '{"model":"glm-5","messages":[{"role":"user","content":"hello"}]}' \
+  -D - -o /dev/null -w "HTTP %{http_code}\n" | grep -i AgentGateway
+```
+
+预期输出包含 `X-AgentGateway-Decision: AUDIT` 头，表示请求被识别为 AI 请求并审计记录后转发。
 
 ## trustexec.sh 配置详解
 
@@ -503,30 +556,6 @@ aip.baidubce.com
 | `GATEWAY_PORT` | `8443` | 网关端口 |
 | `SHIM_PATH` | `gateway/libauditshim.so` | 审计垫片路径（存在时设置 `LD_PRELOAD`） |
 | `CERTS_DIR` | `certs/` | CA 证书目录 |
-
-## 验证拦截
-
-```bash
-# 发送一个测试 AI 请求
-curl -x http://127.0.0.1:8443 \
-  --cacert certs/ca-cert.pem \
-  -X POST https://ai.uniontech.com/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer test-key" \
-  -d '{"model":"glm-5","messages":[{"role":"user","content":"hello"}]}' \
-  -o /dev/null -w "HTTP %{http_code}\n"
-
-# 查看审计日志最新条目
-tail -2 audit/audit.jsonl | python3 -m json.tool
-
-# 查看网关日志
-tail -20 logs/gateway.log
-```
-
-验证要点：
-- HTTP 响应包含 `X-AgentGateway-Decision: AUDIT` 头
-- 网关日志显示 `[CONNECT] ai.uniontech.com:443` 和进程信息
-- 审计日志中 `app_name` 字段显示正确的进程名（如 `curl`，或通过父进程链解析为 `omp`）
 
 ## 测试
 
