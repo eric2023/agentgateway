@@ -388,34 +388,6 @@ def detect_ai_response(body_bytes):
         pass
     return False, {}
 
-# Hosts that may carry AI API requests — only these get MITM'd.
-# Everything else is blind-tunneled (no TLS interception, no cert issues).
-AI_HOST_PATTERNS = [
-    "ai.uniontech.com",
-    "uosai.uniontech.com",
-    "xiaou.uniontech.com",
-    "api.openai.com",
-    "api.anthropic.com",
-    "api.deepseek.com",
-    "api.moonshot.cn",
-    "dashscope.aliyuncs.com",
-    "api.minimax.chat",
-    "api.lingyiwanwu.com",
-    "api.groq.com",
-    "api.together.xyz",
-    "api.mistral.ai",
-    "generativelanguage.googleapis.com",
-    "aip.baidubce.com",
-]
-
-def _should_mitm(host):
-    """Return True if the host should be MITM'd (potential AI API host)."""
-    host_lower = host.lower()
-    for pattern in AI_HOST_PATTERNS:
-        if host_lower == pattern or host_lower.endswith("." + pattern):
-            return True
-    return False
-
 # ─── Peer Process Identification ─────────────────────────────────────────────
 
 _proc_cache = {}          # port → (pid, comm, app_name, ts)
