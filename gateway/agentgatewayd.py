@@ -264,7 +264,11 @@ _upstream_pool = {}  # (host, port) → list of available sockets
 _upstream_pool_lock = threading.Lock()
 
 def _get_upstream_socket(host, port):
-    """Get a pooled upstream socket (TLS if port 443), or create a new one."""
+    """Get a pooled upstream socket (TLS if port 443), or create a new one.
+
+    Returns (sock, is_reused). If a pooled socket is dead, discards it and
+    retries (either with another pooled socket or a fresh connection).
+    """
     key = (host, port)
     with _upstream_pool_lock:
         pool = _upstream_pool.get(key, [])
@@ -274,14 +278,16 @@ def _get_upstream_socket(host, port):
             try:
                 sock.settimeout(0.01)
                 data = sock.recv(1)
-                sock.settimeout(None)
                 if not data:
                     sock.close()
                     continue
-                return sock  # shouldn't happen on idle, but handle it
+                # Unexpected data on idle connection — discard
+                sock.close()
+                continue
             except (BlockingIOError, socket.timeout, ssl.SSLWantReadError):
-                sock.settimeout(None)
-                return sock
+                # No data available → connection is alive
+                sock.settimeout(30)
+                return sock, True
             except (OSError, ssl.SSLError):
                 sock.close()
                 continue
@@ -291,7 +297,8 @@ def _get_upstream_socket(host, port):
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         sock = ctx.wrap_socket(sock, server_hostname=host)
-    return sock
+    sock.settimeout(30)
+    return sock, False
 
 def _return_upstream_socket(host, port, sock):
     """Return a socket to the pool for reuse."""
@@ -1218,8 +1225,25 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _forward_request(self, host, port, method, path, headers, body):
         """Forward request to real destination and return response."""
-        sock = _get_upstream_socket(host, port)
+        # Retry once: a pooled socket may be dead (server closed it after
+        # the keep-alive timeout), in which case recv returns empty and we
+        # need a fresh connection.
+        for _attempt in range(2):
+            sock, is_reused = _get_upstream_socket(host, port)
+            try:
+                return self._do_forward(host, port, sock, method, path, headers, body)
+            except (socket.timeout, ConnectionError, ssl.SSLError, OSError) as e:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                if not is_reused:
+                    raise
+                log(f"[POOL] Retrying {host}:{port} with fresh connection after: {e}")
+        return 502, [], b"Bad Gateway"
 
+    def _do_forward(self, host, port, sock, method, path, headers, body):
+        """Send request on sock, read response, return socket to pool."""
         # Build raw request — use keep-alive so we can return socket to pool
         req_line = f"{method} {path} HTTP/1.1\r\n"
         req = req_line.encode("utf-8")
@@ -1237,7 +1261,7 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
         while b"\r\n\r\n" not in resp_buf:
             chunk = sock.recv(65536)
             if not chunk:
-                break
+                raise ConnectionError("upstream closed connection before headers")
             resp_buf += chunk
 
         header_end = resp_buf.find(b"\r\n\r\n")
@@ -1280,8 +1304,11 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
 
         # Read remaining body
         if is_chunked:
-            # Read until we see 0\r\n\r\n (end of chunked encoding)
-            while b"\r\n0\r\n\r\n" not in body_data:
+            # Read until chunked terminator 0\r\n\r\n appears at end.
+            # Using endswith on the accumulated buffer avoids O(n²) scanning
+            # and correctly handles the terminator spanning recv boundaries.
+            terminator = b"0\r\n\r\n"
+            while not body_data.endswith(terminator):
                 chunk = sock.recv(65536)
                 if not chunk:
                     break
