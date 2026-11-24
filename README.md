@@ -82,7 +82,7 @@ agentgateway/
 ├── audit/
 │   └── audit.jsonl           # 审计日志（JSONL 格式）
 ├── logs/                     # 运行日志
-├── trustexec.sh              # Agent 启动包装器（环境注入）
+├── start.sh                  # 一键启动/停止网关+仪表盘
 └── test_agent_interception.py  # 拦截测试脚本
 ```
 
@@ -176,32 +176,38 @@ export NODE_EXTRA_CA_CERTS=$(pwd)/certs/ca-cert.pem
 
 ```bash
 cd agentgateway
-mkdir -p logs
-
-# 启动网关（MITM 代理，端口 8443）
-python3 gateway/agentgatewayd.py > logs/gateway.log 2>&1 &
-
-# 启动仪表盘（Web UI，端口 9090）
-python3 dashboard/dashboard.py > logs/dashboard.log 2>&1 &
-
-# 等待启动并验证端口监听
-sleep 2 && ss -tlnp | grep -E '8443|9090'
+./start.sh start
 ```
 
+`start.sh` 一键启动网关和仪表盘：
+- **网关**：MITM 代理 `127.0.0.1:8443`，启动时自动设置系统代理为 `manual` 指向网关
+- **仪表盘**：Web UI `http://127.0.0.1:9090`，实时读取审计日志
+- PID 文件管理在 `logs/gateway.pid` / `logs/dashboard.pid`，防止重复启动
+
+| 命令 | 说明 |
+|------|------|
+| `./start.sh start` | 启动网关 + 仪表盘（后台） |
+| `./start.sh stop` | 停止两者（网关退出时自动恢复系统代理） |
+| `./start.sh restart` | 重启两者 |
+| `./start.sh status` | 查看运行状态 |
+
 启动成功标志：
-- 网关日志输出 `AgentGateway started`，监听 `127.0.0.1:8443`
-- 仪表盘日志输出 `URL: http://127.0.0.1:9090`，监听 `127.0.0.1:9090`
+- `./start.sh status` 显示两者均为 `running`
 - 浏览器打开 `http://127.0.0.1:9090` 显示仪表盘页面
+- `gsettings get org.gnome.system.proxy mode` 输出 `'manual'`
+
+> **重要**：网关必须在 Agent 启动**之前**运行。网关负责将系统代理设为 `manual` 指向自身，Agent 启动时读取此设置才会走代理。网关退出时自动恢复原始代理设置。
 
 **故障排查**：
 
 | 现象 | 原因 | 解决 |
 |------|------|------|
-| `Address already in use` | 端口被占用 | `fuser -k 8443/tcp; fuser -k 9090/tcp` |
+| `Address already in use` | 端口被占用 | `./start.sh stop` 后重新 `start` |
 | `No module named 'cryptography'` | 缺少依赖 | `pip install cryptography` |
 | 仪表盘页面空白 | 网关未启动 / 审计日志为空 | 先启动网关，发送一个测试请求 |
 | Agent TLS 报错 | 未信任 CA | 确认通过 trustexec.sh 启动（自动注入 CA） |
 | Qt5 应用 TLS 失败 | 未编译垫片 | 执行部署步骤 2 编译 `libauditshim.so` |
+| 系统代理残留 `manual` | 网关被 SIGKILL 强杀 | 手动执行 `gsettings set org.gnome.system.proxy mode 'auto'` |
 
 ### 通过 trustexec.sh 启动 Agent
 
@@ -276,21 +282,24 @@ curl -s -x http://127.0.0.1:8443 \
 | `AGENTGATEWAY_SESSION_ID` | `session-<uuid>` | 每次启动自动生成的唯一会话标识，写入审计日志 |
 | `AGENTGATEWAY_APP_NAME` | `--app` 参数值 | **已废弃**。网关现在通过 `/proc/<pid>/comm` + 父进程链自动识别应用名，不再使用此变量。仍保留以兼容旧审计日志 |
 
-### DDE 系统代理设置
+### DDE 系统代理设置（网关自动管理）
 
-```bash
-gsettings set org.gnome.system.proxy mode 'manual'
-gsettings set org.gnome.system.proxy.http host '127.0.0.1'
-gsettings set org.gnome.system.proxy.http port 8443
-gsettings set org.gnome.system.proxy.https host '127.0.0.1'
-gsettings set org.gnome.system.proxy.https port 8443
-gsettings set org.gnome.system.proxy.autoconfig-url ""
+系统代理（`gsettings org.gnome.system.proxy`）由**网关守护进程**自动管理，无需手动设置：
+
+- **网关启动时**：快照当前代理设置 → 设为 `manual` 指向 `127.0.0.1:8443`
+- **网关退出时**：恢复快照的原始设置（通过 `atexit` + `SIGTERM` 信号处理）
+
+```python
+# agentgatewayd.py 中的 gw_proxy_setup() / gw_proxy_restore()
+gw_proxy_setup()   # main() 启动时调用：快照 + 设 manual
+gw_proxy_restore() # atexit/SIGTERM 时调用：恢复快照
 ```
 
-**原理**：UOS AI（Qt5 应用）和部分其他应用读取 DDE 系统代理设置（`gsettings org.gnome.system.proxy mode`）而非环境变量。如果 mode 为 `auto`，应用使用 PAC 文件（`auto_proxy`）选择代理，绕过网关。设置为 `manual` 并指向网关端口后，这些应用才会走代理。
+**原理**：UOS AI（Qt5 应用）和 hermes 等应用读取 DDE 系统代理设置而非环境变量。如果 mode 为 `auto`（PAC 模式），应用使用 PAC 文件选择代理，绕过网关。网关设为 `manual` 后这些应用才会走代理。
 
-> **注意**：DDE 桌面环境可能定期将代理模式重置为 `auto`。建议创建监控脚本定期检查并重置。
+> **注意**：网关必须在 Agent 启动**之前**运行。Agent 启动时读取 gsettings，如果此时为 `auto` 则缓存 PAC 代理设置，后续不会更新。守护进程（如 hermes）在网关退出后仍会运行，因此代理生命周期必须绑定到网关进程而非 trustexec.sh。
 
+> **SIGKILL 注意**：`kill -9` 无法触发 atexit/signal 处理，代理会残留 `manual`。使用 `./start.sh stop` 或 `kill <pid>`（SIGTERM）正常退出。若已残留，手动执行 `gsettings set org.gnome.system.proxy mode 'auto'`。
 ### omp daemon 清理
 
 ```bash
@@ -375,21 +384,17 @@ cd /home/ut000520@uos/Desktop/agentos/agentgateway
 
 ## 手动启动 UOS AI 助手
 
-UOS AI（`/usr/bin/uos-ai-assistant`）是 Qt5 应用，需要额外设置 DDE 系统代理：
+UOS AI（`/usr/bin/uos-ai-assistant`）是 Qt5 应用，读取 DDE 系统代理设置。**网关必须已运行**（网关启动时自动设置系统代理为 `manual`）：
 
 ```bash
-# 1. 设置 DDE 系统代理为手动模式
-gsettings set org.gnome.system.proxy mode 'manual'
-gsettings set org.gnome.system.proxy.http host '127.0.0.1'
-gsettings set org.gnome.system.proxy.http port 8443
-gsettings set org.gnome.system.proxy.https host '127.0.0.1'
-gsettings set org.gnome.system.proxy.https port 8443
+# 0. 确保网关已启动（会自动设置 gsettings 为 manual）
+./start.sh status   # 确认 Gateway: running
 
-# 2. 终止现有进程
+# 1. 终止现有进程
 kill -9 $(pgrep -f "uos-ai-assistant") 2>/dev/null
 sleep 3
 
-# 3. 启动 UOS AI（带审计垫片）
+# 2. 启动 UOS AI（带审计垫片）
 HTTPS_PROXY=http://127.0.0.1:8443 \
 HTTP_PROXY=http://127.0.0.1:8443 \
 SSL_CERT_FILE=$(pwd)/certs/ca-cert.pem \
@@ -398,14 +403,14 @@ NODE_EXTRA_CA_CERTS=$(pwd)/certs/ca-cert.pem \
 LD_PRELOAD=$(pwd)/gateway/libauditshim.so \
 /usr/bin/uos-ai-assistant &
 
-# 4. 等待启动后打开聊天页面
+# 3. 等待启动后打开聊天页面
 sleep 8
 dbus-send --session --print-reply \
   --dest=com.deepin.copilot /com/deepin/copilot \
   com.deepin.copilot.launchChatPage
 ```
 
-> **注意**：DDE 代理可能自动重置为 `auto` 模式。可创建一个监控脚本定期检查并重置为 `manual`。
+> 系统代理（gsettings）由网关自动管理，无需手动设置。网关退出时自动恢复为原始值。
 
 ## 应用自动识别
 
@@ -589,23 +594,20 @@ python3 gateway/test_gateway.py
 ## 停止服务
 
 ```bash
-# 停止网关和仪表盘
-fuser -k 8443/tcp 2>/dev/null
-fuser -k 9090/tcp 2>/dev/null
+# 停止网关和仪表盘（网关退出时自动恢复系统代理）
+./start.sh stop
 
 # 停止 UOS AI
 kill $(pgrep -f "uos-ai-assistant") 2>/dev/null
 
 # 停止 omp daemon
 pkill -f "omp __omp_worker_daemon" 2>/dev/null
-
-# 恢复 DDE 代理设置
-gsettings set org.gnome.system.proxy mode 'auto'
 ```
 
 ## 已知限制
 
-- **DDE 代理自动重置**：UOS 桌面环境可能将系统代理从 `manual` 重置为 `auto`，需要定期检查并重置
+- **系统代理生命周期**：网关管理 gsettings 系统代理（`manual` → `auto`），SIGTERM/atexit 正常退出时自动恢复；`kill -9`（SIGKILL）无法恢复，需手动执行 `gsettings set org.gnome.system.proxy mode 'auto'`
+- **网关先于 Agent 启动**：Agent 启动时读取 gsettings 缓存代理设置，网关必须在 Agent 之前启动才能将流量导向网关。守护进程（hermes/uos-ai）启动后不会重新读取 gsettings
 - **omp daemon 环境继承**：omp 的持久 daemon 继承创建它的 omp 会话的环境变量。必须退出现有 omp 会话并重启才能让 daemon 获得代理环境变量
 - **Qt5 TLS 验证**：UOS AI 使用 Qt5 的 TLS 栈，需通过 `LD_PRELOAD` 注入 `libauditshim.so` 钩取 `X509_verify_cert` 才能绕过证书验证
 - **审计垫片全局生效**：`LD_PRELOAD` 对目标进程内所有 TLS 连接生效，非 AI 流量也会被捕获（但不会被拦截）
