@@ -8,6 +8,11 @@ DATA_DIR=/var/lib/agentgateway
 # 数据目录（审计日志）
 mkdir -p "$DATA_DIR"
 
+# 生成 CA 私钥（首次安装；私钥不打包，按机器生成 600 权限）
+if [ ! -f "$AGW_DIR/certs/ca-key.pem" ]; then
+    python3 "$AGW_DIR/gateway/gen_ca.py" || true
+fi
+
 # 系统级 CA 安装（替代方案A的环境变量信任）
 install -m 644 "$AGW_DIR/certs/ca-cert.pem" /etc/ssl/certs/agentgateway-ca.pem
 update-ca-certificates || true
