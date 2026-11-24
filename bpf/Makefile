@@ -17,7 +17,7 @@ LIBDIR   := $(PREFIX)/usr/lib/x86_64-linux-gnu
 LDFLAGS  := -L$(LIBDIR) -lbpf -lelf -lz
 
 all: agent_lsm.bpf.o agent_lsm.skel.h agent_lsm audit_consumer cgroupid agent_admit agent_landlock \
-     agent_uprobe.bpf.o agent_uprobe.skel.h agent_uprobe agent_uprobe_consumer
+     agent_uprobe.bpf.o agent_uprobe.skel.h agent_uprobe agent_uprobe_consumer seccomp_confirm
 
 vmlinux.h:
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
@@ -55,8 +55,11 @@ agent_uprobe: agent_uprobe.c agent_uprobe.skel.h
 agent_uprobe_consumer: agent_uprobe_consumer.c agent_common.h
 	$(CC) -g -Wall -O2 $(INCLUDES) $< -o $@ $(LDFLAGS)
 
+seccomp_confirm: seccomp_confirm.c
+	$(CC) -g -Wall -O2 $< -o $@
+
 clean:
 	rm -f *.o *.skel.h agent_lsm audit_consumer cgroupid agent_admit agent_landlock \
-	      agent_uprobe agent_uprobe_consumer
+	      agent_uprobe agent_uprobe_consumer seccomp_confirm
 
 .PHONY: all clean

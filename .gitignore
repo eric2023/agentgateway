@@ -28,6 +28,7 @@ bpf/agent_admit
 bpf/agent_landlock
 bpf/agent_uprobe
 bpf/agent_uprobe_consumer
+bpf/seccomp_confirm
 
 # OS files
 .DS_Store
