@@ -194,19 +194,30 @@ _ca_cert = None
 _cert_cache = {}  # hostname → (cert_path, key_path)
 _cert_cache_lock = threading.Lock()
 _gateway_key = None  # Reuse one key pair for all generated certs
+_gateway_key_pem = None  # Pre-serialized PEM bytes (avoids re-encoding per host)
 
 def load_ca():
-    global _ca_key, _ca_cert, _gateway_key
+    global _ca_key, _ca_cert, _gateway_key, _gateway_key_pem
     with open(CA_KEY_PATH, "rb") as f:
         _ca_key = serialization.load_pem_private_key(f.read(), password=None)
     with open(CA_CERT_PATH, "rb") as f:
         _ca_cert = x509.load_pem_x509_certificate(f.read())
     # Generate one key pair for all dynamically generated certs
     _gateway_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    _gateway_key_pem = _gateway_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    )
     log(f"[CA] Loaded CA: {_ca_cert.subject.rfc4514_string()}")
 
 def generate_cert_for_host(hostname):
-    """Generate a TLS certificate for the given hostname, signed by AgentGateway CA."""
+    """Generate a TLS certificate for the given hostname, signed by AgentGateway CA.
+
+    Returns (cert_path, key_path) — file paths for ssl.SSLContext.load_cert_chain.
+    Each host gets its own key file to avoid the shared-file race that caused
+    'PEM lib' errors. Files are written once and cached.
+    """
     with _cert_cache_lock:
         if hostname in _cert_cache:
             return _cert_cache[hostname]
@@ -232,22 +243,68 @@ def generate_cert_for_host(hostname):
         .sign(_ca_key, hashes.SHA256())
     )
 
-    # Write to temp files
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
     cert_path = os.path.join(CERT_DIR, f"dyn-{hostname}.pem")
-    key_path = os.path.join(CERT_DIR, "dyn-key.pem")  # Reuse same key
-
+    key_path = os.path.join(CERT_DIR, f"dyn-{hostname}-key.pem")
     with open(cert_path, "wb") as f:
-        f.write(cert.public_bytes(serialization.Encoding.PEM))
+        f.write(cert_pem)
     with open(key_path, "wb") as f:
-        f.write(_gateway_key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.TraditionalOpenSSL,
-            serialization.NoEncryption(),
-        ))
+        f.write(_gateway_key_pem)
 
     with _cert_cache_lock:
+        if hostname in _cert_cache:
+            return _cert_cache[hostname]
         _cert_cache[hostname] = (cert_path, key_path)
-    return cert_path, key_path
+    return _cert_cache[hostname]
+
+# ─── Upstream Connection Pool ────────────────────────────────────────────────
+# Reuse TLS connections to upstream servers to avoid repeated TLS handshakes
+# (the #1 performance bottleneck: each handshake to a real server takes 1-3s).
+_upstream_pool = {}  # (host, port) → list of available sockets
+_upstream_pool_lock = threading.Lock()
+
+def _get_upstream_socket(host, port):
+    """Get a pooled upstream socket (TLS if port 443), or create a new one."""
+    key = (host, port)
+    with _upstream_pool_lock:
+        pool = _upstream_pool.get(key, [])
+        while pool:
+            sock = pool.pop()
+            # Check if socket is still alive (SSLSocket doesn't support MSG_PEEK)
+            try:
+                sock.settimeout(0.01)
+                data = sock.recv(1)
+                sock.settimeout(None)
+                if not data:
+                    sock.close()
+                    continue
+                return sock  # shouldn't happen on idle, but handle it
+            except (BlockingIOError, socket.timeout, ssl.SSLWantReadError):
+                sock.settimeout(None)
+                return sock
+            except (OSError, ssl.SSLError):
+                sock.close()
+                continue
+    sock = socket.create_connection((host, port), timeout=30)
+    if port == 443:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        sock = ctx.wrap_socket(sock, server_hostname=host)
+    return sock
+
+def _return_upstream_socket(host, port, sock):
+    """Return a socket to the pool for reuse."""
+    key = (host, port)
+    with _upstream_pool_lock:
+        pool = _upstream_pool.setdefault(key, [])
+        if len(pool) < 10:
+            pool.append(sock)
+            return
+    try:
+        sock.close()
+    except OSError:
+        pass
 
 # ─── AI Request Detection ─────────────────────────────────────────────────────
 
@@ -866,7 +923,7 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
         # by now the TLS handshake + request read has consumed enough time
         # that it is almost certainly done. Wait a little longer so peer_comm
         # is available for app-source detection, then fall back gracefully.
-        self._join_peer_lookup(timeout=3.0)
+        self._join_peer_lookup(timeout=0.1)
         peer_pid = getattr(self, "_peer_pid", None)
         peer_comm = getattr(self, "_peer_comm", None)
         peer_app_name = getattr(self, "_peer_app_name", None)
@@ -1161,44 +1218,35 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _forward_request(self, host, port, method, path, headers, body):
         """Forward request to real destination and return response."""
-        # Create direct connection to target (bypassing our own proxy)
-        sock = socket.create_connection((host, port), timeout=30)
+        sock = _get_upstream_socket(host, port)
 
-        # Wrap in TLS if port is 443
-        if port == 443:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            sock = ctx.wrap_socket(sock, server_hostname=host)
-
-        # Build raw request
+        # Build raw request — use keep-alive so we can return socket to pool
         req_line = f"{method} {path} HTTP/1.1\r\n"
         req = req_line.encode("utf-8")
         for k, v in headers.items():
-            if k.lower() in ("proxy-connection", "proxy-authorization"):
+            if k.lower() in ("proxy-connection", "proxy-authorization", "connection"):
                 continue
             req += f"{k}: {v}\r\n".encode("utf-8")
-        req += b"Connection: close\r\n\r\n"
+        req += b"Connection: keep-alive\r\n\r\n"
         req += body
 
         sock.sendall(req)
 
-        # Read response
-        resp_data = b""
-        while True:
+        # Read response — read headers first, then body by Content-Length or chunked
+        resp_buf = b""
+        while b"\r\n\r\n" not in resp_buf:
             chunk = sock.recv(65536)
             if not chunk:
                 break
-            resp_data += chunk
-        sock.close()
+            resp_buf += chunk
 
-        # Parse response
-        header_end = resp_data.find(b"\r\n\r\n")
+        header_end = resp_buf.find(b"\r\n\r\n")
         if header_end == -1:
+            _return_upstream_socket(host, port, sock)
             return 502, [], b"Bad Gateway"
 
-        header_block = resp_data[:header_end].decode("utf-8", errors="replace")
-        body_data = resp_data[header_end + 4:]
+        header_block = resp_buf[:header_end].decode("utf-8", errors="replace")
+        body_data = resp_buf[header_end + 4:]
 
         lines = header_block.split("\r\n")
         status_line = lines[0]
@@ -1214,11 +1262,54 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
                 k, v = line.split(":", 1)
                 resp_headers.append((k.strip(), v.strip()))
 
-        # Handle chunked encoding in response
+        # Determine body length to know when we've read the full response
+        content_length = None
+        is_chunked = False
+        connection_close = False
         for k, v in resp_headers:
-            if k.lower() == "transfer-encoding" and "chunked" in v.lower():
-                body_data = self._dechunk(body_data)
-                break
+            kl = k.lower()
+            if kl == "content-length":
+                try:
+                    content_length = int(v)
+                except ValueError:
+                    pass
+            elif kl == "transfer-encoding" and "chunked" in v.lower():
+                is_chunked = True
+            elif kl == "connection" and "close" in v.lower():
+                connection_close = True
+
+        # Read remaining body
+        if is_chunked:
+            # Read until we see 0\r\n\r\n (end of chunked encoding)
+            while b"\r\n0\r\n\r\n" not in body_data:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                body_data += chunk
+            body_data = self._dechunk(body_data)
+        elif content_length is not None:
+            while len(body_data) < content_length:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                body_data += chunk
+        else:
+            # No content-length, no chunked — read until connection closes
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                body_data += chunk
+            connection_close = True
+
+        # Return socket to pool if server supports keep-alive
+        if connection_close:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        else:
+            _return_upstream_socket(host, port, sock)
 
         return status_code, resp_headers, body_data
 
