@@ -1,0 +1,21 @@
+# Runtime-generated files (not tracked)
+certs/dyn-*
+certs/*-key.pem
+certs/ca-key.pem
+
+# Logs
+logs/
+
+# Audit data (runtime-generated, may contain sensitive content)
+audit/audit.jsonl
+audit/test_report.md
+
+# Compiled artifacts (rebuilt from source)
+gateway/libauditshim.so
+*.pyc
+__pycache__/
+
+# OS files
+.DS_Store
+*.swp
+*~

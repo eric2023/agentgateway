@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentGateway — AI 请求监控</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --surface-hover: #232733;
+    --border: #2a2e3a; --fg: #e4e6eb; --muted: #8b8fa3;
+    --accent: #4fc3f7; --danger: #f44336; --success: #4caf50; --warning: #ff9800;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+    background:var(--bg); color:var(--fg); padding:20px; min-height:100vh; }
+  .header { display:flex; align-items:center; justify-content:space-between; margin-bottom:24px; }
+  .header h1 { font-size:24px; font-weight:600; }
+  .header h1 span { color:var(--accent); }
+  .tabs { display:flex; gap:4px; }
+  .tab { padding:8px 16px; border-radius:8px; cursor:pointer; font-size:14px; color:var(--muted); border:1px solid transparent; }
+  .tab.active { background:var(--surface); color:var(--accent); border-color:var(--border); }
+  .tab:hover { color:var(--fg); }
+  .status { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--muted); }
+  .status-dot { width:8px; height:8px; border-radius:50%; background:var(--success); animation:pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+  .stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:16px; margin-bottom:24px; }
+  .stat-card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:20px; }
+  .stat-card .label { font-size:13px; color:var(--muted); margin-bottom:8px; }
+  .stat-card .value { font-size:32px; font-weight:700; }
+  .stat-card.blocked .value { color:var(--danger); }
+  .stat-card.forwarded .value { color:var(--success); }
+  .stat-card.total .value { color:var(--accent); }
+  .charts-row { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:24px; }
+  @media (max-width:900px) { .charts-row { grid-template-columns:1fr; } }
+  .chart-card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:20px; }
+  .chart-card h3 { font-size:15px; color:var(--muted); margin-bottom:16px; }
+  .chart-container { position:relative; height:250px; }
+  .table-section { background:var(--surface); border:1px solid var(--border); border-radius:12px; margin-bottom:24px; overflow:hidden; }
+  .section-header { padding:16px 20px; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; }
+  .section-header h2 { font-size:16px; font-weight:600; }
+  .badge { display:inline-block; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:600; }
+  .badge.blocked { background:rgba(244,67,54,0.15); color:var(--danger); }
+  .badge.audit { background:rgba(255,152,0,0.15); color:var(--warning); }
+  .badge.forwarded { background:rgba(76,175,80,0.15); color:var(--success); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; padding:10px 16px; color:var(--muted); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:0.5px; border-bottom:1px solid var(--border); }
+  td { padding:12px 16px; border-bottom:1px solid var(--border); vertical-align:top; }
+  tr:hover { background:var(--surface-hover); }
+  tr:last-child td { border-bottom:none; }
+  .method-badge { display:inline-block; padding:1px 6px; border-radius:4px; font-size:11px; font-weight:600; background:rgba(79,195,247,0.15); color:var(--accent); }
+  .preview { max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted); font-size:12px; }
+  .signals { display:flex; flex-wrap:wrap; gap:4px; }
+  .signal-tag { display:inline-block; padding:1px 6px; border-radius:4px; font-size:11px; background:rgba(255,152,0,0.12); color:var(--warning); }
+  .empty { padding:40px; text-align:center; color:var(--muted); }
+  .confidence-bar { width:60px; height:6px; background:var(--border); border-radius:3px; overflow:hidden; display:inline-block; vertical-align:middle; margin-right:6px; }
+  .confidence-fill { height:100%; background:var(--danger); border-radius:3px; }
+  .ts { white-space:nowrap; font-size:12px; color:var(--muted); }
+  .path { font-family:monospace; font-size:12px; }
+  .footer { text-align:center; color:var(--muted); font-size:12px; padding:20px; }
+  .page { display:none; }
+  .page.active { display:block; }
+  tr.clickable { cursor:pointer; }
+  tr.clickable:hover { background:var(--surface-hover); }
+  .status-code { display:inline-block; padding:2px 8px; border-radius:4px; font-size:12px; font-weight:600; }
+  .status-2xx { background:rgba(76,175,80,0.15); color:var(--success); }
+  .status-4xx { background:rgba(255,152,0,0.15); color:var(--warning); }
+  .status-5xx { background:rgba(244,67,54,0.15); color:var(--danger); }
+  .token-badge { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; background:rgba(79,195,247,0.12); color:var(--accent); }
+  .latency { font-size:12px; color:var(--muted); }
+  .stream-tag { display:inline-block; padding:1px 6px; border-radius:4px; font-size:10px; background:rgba(156,39,176,0.15); color:#ce93d8; }
+
+  /* Modal */
+  .modal-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); z-index:1000; overflow-y:auto; }
+  .modal-overlay.show { display:block; }
+  .modal { background:var(--surface); margin:40px auto; max-width:1100px; width:90%; border-radius:12px; border:1px solid var(--border); }
+  .modal-header { padding:16px 24px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; }
+  .modal-header h2 { font-size:18px; }
+  .modal-close { background:none; border:none; color:var(--muted); font-size:24px; cursor:pointer; padding:4px 8px; }
+  .modal-close:hover { color:var(--fg); }
+  .modal-body { padding:24px; max-height:80vh; overflow-y:auto; }
+  .detail-section { margin-bottom:24px; }
+  .detail-section h3 { font-size:14px; color:var(--accent); margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid var(--border); }
+  .detail-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:12px; margin-bottom:16px; }
+  .detail-item { background:var(--bg); padding:12px; border-radius:8px; border:1px solid var(--border); }
+  .detail-item .key { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px; }
+  .detail-item .val { font-size:14px; font-weight:600; }
+  .json-viewer { background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:16px; font-family:'Fira Code',monospace; font-size:12px; overflow-x:auto; max-height:400px; overflow-y:auto; white-space:pre-wrap; word-break:break-all; }
+  .headers-list { background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:12px; }
+  .header-row { display:flex; padding:4px 0; border-bottom:1px solid var(--border); font-size:12px; }
+  .header-row:last-child { border-bottom:none; }
+  .header-key { color:var(--accent); min-width:200px; font-weight:600; }
+  .header-val { color:var(--fg); word-break:break-all; }
+  .conversation-msg { padding:12px; margin-bottom:8px; border-radius:8px; border:1px solid var(--border); }
+  .conversation-msg .role { font-size:11px; font-weight:600; text-transform:uppercase; margin-bottom:4px; }
+  .conversation-msg .role.user { color:var(--accent); }
+  .conversation-msg .role.assistant { color:var(--success); }
+  .conversation-msg .role.system { color:var(--warning); }
+  .conversation-msg .content { font-size:13px; color:var(--fg); white-space:pre-wrap; word-break:break-word; }
+
+  /* Trace view */
+  .trace-card { background:var(--surface); border:1px solid var(--border); border-radius:12px; margin-bottom:16px; overflow:hidden; }
+  .trace-header { padding:16px 20px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; cursor:pointer; }
+  .trace-header:hover { background:var(--surface-hover); }
+  .trace-info { display:flex; gap:24px; align-items:center; }
+  .trace-timeline { padding:16px 20px; display:none; }
+  .trace-timeline.show { display:block; }
+  .trace-event { display:flex; gap:12px; padding:8px 0; border-bottom:1px solid var(--border); position:relative; }
+  .trace-event:last-child { border-bottom:none; }
+  .trace-event-time { font-size:11px; color:var(--muted); white-space:nowrap; min-width:80px; }
+  .trace-event-type { font-size:12px; font-weight:600; min-width:140px; }
+  .trace-event-detail { font-size:12px; color:var(--muted); flex:1; }
+  .trace-event-tokens { font-size:11px; color:var(--accent); }
+  .refresh-btn { padding:6px 14px; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--fg); font-size:13px; cursor:pointer; }
+  .refresh-btn:hover { background:var(--surface-hover); border-color:var(--accent); }
+  .auto-refresh-toggle { display:flex; align-items:center; gap:4px; font-size:12px; color:var(--muted); cursor:pointer; }
+  .auto-refresh-toggle input { cursor:pointer; }
+  .app-badge { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; background:rgba(156,39,176,0.15); color:#ce93d8; white-space:nowrap; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span>Agent</span>Gateway</h1>
+  <div class="tabs">
+    <div class="tab active" onclick="showPage('overview',this)">📊 概览</div>
+    <div class="tab" onclick="showPage('requests',this)">📋 请求</div>
+    <div class="tab" onclick="showPage('traces',this)">🔗 跟踪</div>
+  </div>
+  <div class="status">
+    <button class="refresh-btn" onclick="manualRefresh()">🔄 刷新</button>
+    <label class="auto-refresh-toggle"><input type="checkbox" id="auto-refresh" checked onchange="toggleAutoRefresh()"> 自动刷新</label>
+    <div class="status-dot" id="status-dot"></div>
+    <span id="last-update">实时监控中</span>
+  </div>
+</div>
+
+<!-- Page: Overview -->
+<div class="page active" id="page-overview">
+  <div class="stats-grid">
+    <div class="stat-card total"><div class="label">总事件数</div><div class="value" id="stat-total">__TOTAL__</div></div>
+    <div class="stat-card blocked"><div class="label">🚫 拦截 (BLOCK)</div><div class="value" id="stat-blocked">__BLOCKED__</div></div>
+    <div class="stat-card forwarded"><div class="label">✅ 放行 (FORWARD)</div><div class="value" id="stat-forwarded">__FORWARDED__</div></div>
+    <div class="stat-card"><div class="label">📋 审计 (AUDIT)</div><div class="value" id="stat-audited" style="color:var(--warning)">__AUDITED__</div></div>
+  </div>
+  <div class="charts-row">
+    <div class="chart-card">
+      <h3>📊 请求时间线 (本地时间)</h3>
+      <div class="chart-container"><canvas id="timeline-chart"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <h3>🎯 AI 请求按模型分布</h3>
+      <div class="chart-container"><canvas id="model-chart"></canvas></div>
+    </div>
+  </div>
+  <div class="table-section">
+    <div class="section-header"><h2>🌐 按目标主机统计</h2></div>
+    <table>
+      <thead><tr><th>主机</th><th>决策</th><th>请求数</th></tr></thead>
+      <tbody id="host-tbody">__HOST_ROWS__</tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Page: Requests -->
+<div class="page" id="page-requests">
+  <div class="table-section">
+    <div class="section-header">
+      <h2>📋 AI 请求列表</h2>
+      <span class="badge audit" id="req-count">0</span>
+    </div>
+    <div style="padding:12px 20px; border-bottom:1px solid var(--border);">
+      <input type="text" id="req-search" placeholder="搜索模型、路径、主机..." oninput="filterRequests()" style="width:100%; padding:8px 12px; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--fg); font-size:13px;">
+    </div>
+    <div style="overflow-x:auto;">
+    <table id="requests-table">
+      <thead><tr>
+        <th>时间 (本地)</th><th>应用</th><th>方法</th><th>主机</th><th>路径</th><th>模型</th>
+        <th>状态</th><th>流式</th><th>延迟</th><th>Token</th><th>置信度</th><th>预览</th>
+      </tr></thead>
+      <tbody id="requests-tbody"></tbody>
+    </table>
+    </div>
+  </div>
+</div>
+
+<!-- Page: Traces -->
+<div class="page" id="page-traces">
+  <div class="table-section">
+    <div class="section-header">
+      <h2>🔗 会话跟踪 (按对话分组)</h2>
+      <span class="badge audit" id="trace-count">0</span>
+    </div>
+    <div id="traces-container"></div>
+  </div>
+</div>
+
+<div class="footer">AgentGateway Dashboard v2.0 · 数据源: audit/audit.jsonl · 自动刷新: 5秒 · 时区: Asia/Shanghai (UTC+8)</div>
+
+<!-- Modal for request detail -->
+<div class="modal-overlay" id="modal-overlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <h2 id="modal-title">请求详情</h2>
+      <button class="modal-close" onclick="closeModal()">&times;</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
+<script>
+let allRequests = [];
+let allTraces = [];
+
+function showPage(name, el) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('page-' + name).classList.add('active');
+  el.classList.add('active');
+}
+
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('show');
+}
+
+function statusClass(code) {
+  if (!code) return '';
+  if (code < 300) return 'status-2xx';
+  if (code < 500) return 'status-4xx';
+  return 'status-5xx';
+}
+
+function escapeHtml(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function toShortTs(ts) {
+  if (!ts) return '';
+  // Extract HH:MM:SS from ISO timestamp
+  const m = ts.match(/T(\d{2}:\d{2}:\d{2})/);
+  return m ? m[1] : ts;
+}
+
+function extractToolCallsFromEvent(reqBody, respBody) {
+  const results = [];
+  const toolResults = {};
+  if (reqBody && typeof reqBody === 'object') {
+    const messages = reqBody.messages || [];
+    for (const m of messages) {
+      if (m.role === 'tool' && m.tool_call_id) {
+        const c = m.content || '';
+        toolResults[m.tool_call_id] = c.substring(0, 120);
+      }
+    }
+    for (const m of messages) {
+      if (m.role === 'assistant' && m.tool_calls) {
+        for (const tc of m.tool_calls) {
+          const fn = tc.function || {};
+          const name = fn.name || '';
+          let args = fn.arguments || '';
+          let argsSummary = '';
+          try { args = typeof args === 'string' ? JSON.parse(args) : args; } catch(e) {}
+          if (typeof args === 'object' && args) {
+            const keys = Object.keys(args);
+            if (keys.length <= 3) {
+              argsSummary = keys.map(k => k + '=' + (typeof args[k] === 'string' ? args[k].substring(0,60) : JSON.stringify(args[k]).substring(0,60))).join(', ');
+            } else {
+              argsSummary = keys.join(', ');
+            }
+          } else {
+            argsSummary = String(args).substring(0, 80);
+          }
+          results.push({ tool_name: name, args_summary: argsSummary, result: toolResults[tc.id] || '' });
+        }
+      }
+    }
+  }
+  if (respBody && typeof respBody === 'object') {
+    const choices = respBody.choices || [];
+    for (const c of choices) {
+      const msg = c.message || {};
+      if (msg.tool_calls) {
+        for (const tc of msg.tool_calls) {
+          const fn = tc.function || {};
+          const name = fn.name || '';
+          let args = fn.arguments || '';
+          let argsSummary = '';
+          try { args = typeof args === 'string' ? JSON.parse(args) : args; } catch(e) {}
+          if (typeof args === 'object' && args) {
+            const keys = Object.keys(args);
+            if (keys.length <= 3) {
+              argsSummary = keys.map(k => k + '=' + (typeof args[k] === 'string' ? args[k].substring(0,60) : JSON.stringify(args[k]).substring(0,60))).join(', ');
+            } else {
+              argsSummary = keys.join(', ');
+            }
+          } else {
+            argsSummary = String(args).substring(0, 80);
+          }
+          if (!results.find(r => r.call_id === tc.id)) {
+            results.push({ tool_name: name, args_summary: argsSummary, result: '' });
+          }
+        }
+      }
+    }
+  }
+  return results;
+}
+
+function renderRequests(reqs) {
+  allRequests = reqs;
+  document.getElementById('req-count').textContent = reqs.length;
+  const tbody = document.getElementById('requests-tbody');
+  if (!reqs.length) {
+    tbody.innerHTML = '<tr><td colspan="12" class="empty">暂无 AI 请求记录</td></tr>';
+    return;
+  }
+  tbody.innerHTML = reqs.map((r, i) => {
+    const ts = r.ts || '?';
+    const status = r.response_status;
+    const statusHtml = status ? `<span class="status-code ${statusClass(status)}">${status}</span>` : '<span style="color:var(--muted)">—</span>';
+    const streamHtml = r.stream_mode ? '<span class="stream-tag">stream</span>' : '';
+    const latency = r.latency_ms != null ? `<span class="latency">${r.latency_ms}ms</span>` : '—';
+    const tokens = (r.token_usage && r.token_usage.total_tokens) ? `<span class="token-badge">${r.token_usage.total_tokens}</span>` : '—';
+    const conf = r.confidence || 0;
+    const confPct = Math.min(conf * 10, 100);
+    const preview = escapeHtml((r.preview || '').substring(0, 80));
+    const appBadge = r.app_name && r.app_name !== 'unknown' ? `<span class="app-badge">${escapeHtml(r.app_name)}</span>` : '<span style="color:var(--muted)">—</span>';
+    return `<tr class="clickable" onclick="showDetail(${i})">
+      <td class="ts">${ts}</td>
+      <td>${appBadge}</td>
+      <td><span class="method-badge">${r.method||'?'}</span></td>
+      <td>${escapeHtml(r.host||'?')}</td>
+      <td class="path">${escapeHtml(r.path||'?')}</td>
+      <td><strong>${escapeHtml(r.model||'?')}</strong></td>
+      <td>${statusHtml}</td>
+      <td>${streamHtml}</td>
+      <td>${latency}</td>
+      <td>${tokens}</td>
+      <td><span class="confidence-bar"><span class="confidence-fill" style="width:${confPct}%"></span></span>${conf}</td>
+      <td><div class="preview" title="${preview}">${preview}</div></td>
+    </tr>`;
+  }).join('');
+}
+
+function filterRequests() {
+  const q = document.getElementById('req-search').value.toLowerCase();
+  if (!q) { renderRequests(allRequests); return; }
+  const filtered = allRequests.filter(r =>
+    (r.model||'').toLowerCase().includes(q) ||
+    (r.host||'').toLowerCase().includes(q) ||
+    (r.path||'').toLowerCase().includes(q) ||
+    (r.preview||'').toLowerCase().includes(q) ||
+    (r.app_name||'').toLowerCase().includes(q)
+  );
+  document.getElementById('req-count').textContent = filtered.length;
+  const tbody = document.getElementById('requests-tbody');
+  if (!filtered.length) {
+    tbody.innerHTML = '<tr><td colspan="12" class="empty">无匹配结果</td></tr>';
+    return;
+  }
+  tbody.innerHTML = filtered.map((r, i) => {
+    const origIdx = allRequests.indexOf(r);
+    const status = r.response_status;
+    const statusHtml = status ? `<span class="status-code ${statusClass(status)}">${status}</span>` : '<span style="color:var(--muted)">—</span>';
+    const streamHtml = r.stream_mode ? '<span class="stream-tag">stream</span>' : '';
+    const latency = r.latency_ms != null ? `<span class="latency">${r.latency_ms}ms</span>` : '—';
+    const tokens = (r.token_usage && r.token_usage.total_tokens) ? `<span class="token-badge">${r.token_usage.total_tokens}</span>` : '—';
+    const conf = r.confidence || 0;
+    const confPct = Math.min(conf * 10, 100);
+    const preview = escapeHtml((r.preview || '').substring(0, 80));
+    const appBadge = r.app_name && r.app_name !== 'unknown' ? `<span class="app-badge">${escapeHtml(r.app_name)}</span>` : '<span style="color:var(--muted)">—</span>';
+    return `<tr class="clickable" onclick="showDetail(${origIdx})">
+      <td class="ts">${r.ts||'?'}</td>
+      <td>${appBadge}</td>
+      <td><span class="method-badge">${r.method||'?'}</span></td>
+      <td>${escapeHtml(r.host||'?')}</td>
+      <td class="path">${escapeHtml(r.path||'?')}</td>
+      <td><strong>${escapeHtml(r.model||'?')}</strong></td>
+      <td>${statusHtml}</td>
+      <td>${streamHtml}</td>
+      <td>${latency}</td>
+      <td>${tokens}</td>
+      <td><span class="confidence-bar"><span class="confidence-fill" style="width:${confPct}%"></span></span>${conf}</td>
+      <td><div class="preview" title="${preview}">${preview}</div></td>
+    </tr>`;
+  }).join('');
+}
+
+function showDetail(idx) {
+  const r = allRequests[idx];
+  if (!r) return;
+  const body = document.getElementById('modal-body');
+  const title = document.getElementById('modal-title');
+  title.textContent = `${r.method || '?'} ${r.host || ''}${r.path || ''}`;
+
+  let html = '';
+
+  // Basic info
+  html += '<div class="detail-section"><h3>📋 基本信息</h3><div class="detail-grid">';
+  html += detailItem('请求ID', r.request_id);
+  html += detailItem('时间 (本地)', r.ts);
+  html += detailItem('应用', r.app_name || 'unknown');
+  html += detailItem('方法', r.method);
+  html += detailItem('主机', r.host);
+  html += detailItem('路径', r.path);
+  html += detailItem('模型', r.model);
+  html += detailItem('流式模式', r.stream_mode ? '是' : '否');
+  html += detailItem('会话ID', r.session_id);
+  html += detailItem('Agent ID', r.agent_id);
+  if (r.response_status) html += detailItem('响应状态', r.response_status);
+  if (r.latency_ms != null) html += detailItem('延迟', r.latency_ms + ' ms');
+  html += '</div></div>';
+
+  // Token usage
+  if (r.token_usage && Object.keys(r.token_usage).length) {
+    const tu = r.token_usage;
+    html += '<div class="detail-section"><h3>🔢 Token 使用</h3><div class="detail-grid">';
+    html += detailItem('总 Token', tu.total_tokens || 0);
+    html += detailItem('输入 Token', tu.prompt_tokens || 0);
+    html += detailItem('输出 Token', tu.completion_tokens || 0);
+    html += detailItem('缓存 Token', tu.cached_tokens || 0);
+    html += '</div></div>';
+  }
+
+  // Tool calls
+  if (r.tool_calls && r.tool_calls.length) {
+    html += '<div class="detail-section"><h3>🔧 工具调用 (' + r.tool_calls.length + ')</h3>';
+    if (r.tools_defined && r.tools_defined.length) {
+      html += '<div style="margin-bottom:12px;font-size:12px;color:var(--muted);">可用工具: ' + r.tools_defined.map(escapeHtml).join(', ') + '</div>';
+    }
+    r.tool_calls.forEach((tc, i) => {
+      html += '<div class="trace-event" style="margin-left:0;border-left:2px solid var(--accent);padding-left:12px;margin-bottom:8px;">';
+      html += '<div style="font-size:13px;font-weight:600;color:var(--accent);">🔧 ' + escapeHtml(tc.tool_name) + '</div>';
+      html += '<div style="font-size:12px;color:var(--muted);margin-top:4px;">参数: ' + escapeHtml(JSON.stringify(tc.arguments, null, 2)) + '</div>';
+      if (tc.result_preview) {
+        html += '<div style="font-size:12px;color:var(--success);margin-top:4px;">结果: ' + escapeHtml(tc.result_preview) + '</div>';
+      }
+      html += '</div>';
+    });
+    html += '</div>';
+  }
+
+  // Signals
+  if (r.signals && r.signals.length) {
+    html += '<div class="detail-section"><h3>🔍 识别信号</h3><div class="signals">';
+    r.signals.forEach(s => { html += `<span class="signal-tag">${escapeHtml(s)}</span>`; });
+    html += '</div></div>';
+  }
+
+  // Request headers
+  if (r.request_headers && Object.keys(r.request_headers).length) {
+    html += '<div class="detail-section"><h3>📤 请求头</h3><div class="headers-list">';
+    Object.entries(r.request_headers).forEach(([k, v]) => {
+      html += `<div class="header-row"><span class="header-key">${escapeHtml(k)}</span><span class="header-val">${escapeHtml(v)}</span></div>`;
+    });
+    html += '</div></div>';
+  }
+
+  // Request body — conversation view
+  if (r.request_body) {
+    html += '<div class="detail-section"><h3>📝 请求体 (对话视图)</h3>';
+    if (r.request_body.messages && Array.isArray(r.request_body.messages)) {
+      r.request_body.messages.forEach(msg => {
+        const role = msg.role || 'unknown';
+        let content = msg.content;
+        if (Array.isArray(content)) {
+          content = content.map(c => typeof c === 'string' ? c : (c.text || JSON.stringify(c))).join('\n');
+        }
+        html += `<div class="conversation-msg"><div class="role ${escapeHtml(role)}">${escapeHtml(role)}</div><div class="content">${escapeHtml(content || '')}</div></div>`;
+      });
+    }
+    html += '<div style="margin-top:12px"><h4 style="color:var(--muted);font-size:12px;margin-bottom:8px;">原始 JSON</h4><div class="json-viewer">' + escapeHtml(JSON.stringify(r.request_body, null, 2)) + '</div></div>';
+    html += '</div>';
+  }
+
+  // Response headers
+  if (r.response_headers && Object.keys(r.response_headers).length) {
+    html += '<div class="detail-section"><h3>📥 响应头</h3><div class="headers-list">';
+    Object.entries(r.response_headers).forEach(([k, v]) => {
+      html += `<div class="header-row"><span class="header-key">${escapeHtml(k)}</span><span class="header-val">${escapeHtml(v)}</span></div>`;
+    });
+    html += '</div></div>';
+  }
+
+  // Response body
+  if (r.response_body) {
+    html += '<div class="detail-section"><h3>💬 响应体</h3>';
+    // Try conversation view for response
+    if (r.response_body.choices && Array.isArray(r.response_body.choices)) {
+      r.response_body.choices.forEach(choice => {
+        const msg = choice.message || {};
+        const role = msg.role || 'assistant';
+        let content = msg.content || '';
+        if (Array.isArray(content)) {
+          content = content.map(c => typeof c === 'string' ? c : (c.text || JSON.stringify(c))).join('\n');
+        }
+        html += `<div class="conversation-msg"><div class="role ${escapeHtml(role)}">${escapeHtml(role)} (finish: ${escapeHtml(choice.finish_reason||'')})</div><div class="content">${escapeHtml(content)}</div></div>`;
+      });
+    } else if (r.response_body.content && Array.isArray(r.response_body.content)) {
+      // Anthropic-style
+      r.response_body.content.forEach(block => {
+        html += `<div class="conversation-msg"><div class="role assistant">${escapeHtml(block.type||'assistant')}</div><div class="content">${escapeHtml(block.text || JSON.stringify(block))}</div></div>`;
+      });
+    }
+    html += '<div style="margin-top:12px"><h4 style="color:var(--muted);font-size:12px;margin-bottom:8px;">原始 JSON</h4><div class="json-viewer">' + escapeHtml(JSON.stringify(r.response_body, null, 2)) + '</div></div>';
+    html += '</div>';
+  } else if (r.error) {
+    html += `<div class="detail-section"><h3>❌ 错误</h3><div class="json-viewer" style="color:var(--danger)">${escapeHtml(r.error)}</div></div>`;
+  }
+
+  body.innerHTML = html;
+  document.getElementById('modal-overlay').classList.add('show');
+}
+
+function detailItem(key, val) {
+  return `<div class="detail-item"><div class="key">${escapeHtml(key)}</div><div class="val">${escapeHtml(val || '—')}</div></div>`;
+}
+
+function renderTraces(traces) {
+  allTraces = traces;
+  document.getElementById('trace-count').textContent = traces.length;
+  const container = document.getElementById('traces-container');
+  if (!traces.length) {
+    container.innerHTML = '<div class="empty">暂无跟踪记录</div>';
+    return;
+  }
+  container.innerHTML = traces.map((t, i) => {
+    const isExpanded = expandedTraces.has(t.conversation_id);
+    const appLabel = t.app_name && t.app_name !== 'unknown' && t.app_name !== 'Unknown'
+      ? '<span class="app-badge">' + escapeHtml(t.app_name) + '</span>'
+      : '<span class="app-badge" style="background:rgba(244,67,54,0.15);color:#ef5350;">Unknown</span>';
+    const convTitle = t.first_user_msg
+      ? escapeHtml(t.first_user_msg.length > 40 ? t.first_user_msg.substring(0,40) + '…' : t.first_user_msg)
+      : '(无用户消息)';
+    return `<div class="trace-card">
+      <div class="trace-header" onclick="toggleTrace(${i})">
+        <div class="trace-info">
+          <div>
+            <div style="font-size:14px;font-weight:600;">${appLabel} ${convTitle}</div>
+            <div style="font-size:11px;color:var(--muted);margin-top:4px;">${t.first_ts} → ${t.last_ts}</div>
+          </div>
+        </div>
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+          <span class="badge audit">${t.request_count} 请求</span>
+          ${t.total_tokens ? `<span class="token-badge">${t.total_tokens} tokens</span>` : ''}
+          ${t.tool_call_count > 0 ? `<span class="badge" style="background:rgba(33,150,243,0.15);color:#64b5f6;">🔧 ${t.tool_call_count} 工具调用</span>` : ''}
+          ${t.has_skill ? `<span class="badge" style="background:rgba(156,39,176,0.15);color:#ce93d8;">⚡ skill</span>` : ''}
+        </div>
+      </div>
+      <div class="trace-timeline${isExpanded ? ' show' : ''}" id="trace-${i}" data-session="${escapeHtml(t.conversation_id)}">
+        ${(() => {
+          const rows = [];
+          if (t.tools_defined && t.tools_defined.length) {
+            rows.push(`<div class="trace-event" style="border-left:2px solid var(--warning);padding-left:12px;margin-bottom:4px;">
+              <span class="trace-event-time"></span>
+              <span class="trace-event-type" style="color:var(--warning);">📦 可用工具</span>
+              <span class="trace-event-detail">${t.tools_defined.map(escapeHtml).join(', ')}</span>
+            </div>`);
+          }
+          for (const e of t.events) {
+            const evType = e.event || '?';
+            const model = e.model || '';
+            const status = e.response_status || '';
+            const latency = e.latency_ms != null ? e.latency_ms + 'ms' : '';
+            const tokens = (e.token_usage && e.token_usage.total_tokens) ? e.token_usage.total_tokens + ' tokens' : '';
+            const preview = (e.preview || e.summary || '').substring(0, 80);
+            rows.push(`<div class="trace-event">
+              <span class="trace-event-time">${toShortTs(e.ts) || '?'}</span>
+              <span class="trace-event-type">${escapeHtml(evType)} ${escapeHtml(model)}</span>
+              <span class="trace-event-detail">${escapeHtml(status)} ${escapeHtml(latency)} ${escapeHtml(preview)}</span>
+              <span class="trace-event-tokens">${escapeHtml(tokens)}</span>
+            </div>`);
+            const tcRows = extractToolCallsFromEvent(e.request_body, e.response_body);
+            for (const tc of tcRows) {
+              rows.push(`<div class="trace-event" style="margin-left:32px;border-left:2px solid var(--accent);padding-left:12px;">
+                <span class="trace-event-time"></span>
+                <span class="trace-event-type" style="color:var(--accent);">🔧 ${escapeHtml(tc.tool_name)}</span>
+                <span class="trace-event-detail">${escapeHtml(tc.args_summary)}</span>
+                ${tc.result ? `<span class="trace-event-tokens" style="color:var(--success);font-size:10px;">✓ ${escapeHtml(tc.result)}</span>` : ''}
+              </div>`);
+            }
+          }
+          return rows.join('');
+        })()}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function toggleTrace(idx) {
+  const el = document.getElementById('trace-' + idx);
+  const isShown = el.classList.contains('show');
+  el.classList.toggle('show');
+  const sid = el.getAttribute('data-session');
+  if (!isShown) {
+    if (sid) expandedTraces.add(sid);
+    autoRefreshPaused = true;
+    document.getElementById('auto-refresh').checked = false;
+    document.getElementById('last-update').textContent = '已暂停 (跟踪展开)';
+  } else {
+    if (sid) expandedTraces.delete(sid);
+    if (expandedTraces.size === 0) {
+      autoRefreshPaused = false;
+      document.getElementById('auto-refresh').checked = true;
+      document.getElementById('last-update').textContent = '实时监控中';
+    }
+  }
+}
+
+function toggleAutoRefresh() {
+  const checked = document.getElementById('auto-refresh').checked;
+  autoRefreshPaused = !checked;
+  if (checked) {
+    document.getElementById('last-update').textContent = '实时监控中';
+  } else {
+    document.getElementById('last-update').textContent = '已暂停';
+  }
+}
+
+function manualRefresh() {
+  doRefresh();
+  document.getElementById('last-update').textContent = '已刷新 ' + new Date().toLocaleTimeString();
+}
+
+const tlData = __TIMELINE_DATA__;
+const mdData = __MODEL_DATA__;
+
+const tlCtx = document.getElementById('timeline-chart').getContext('2d');
+const timelineChart = new Chart(tlCtx, {
+  type: 'bar',
+  data: {
+    labels: tlData.map(d => d.minute),
+    datasets: [
+      { label: '拦截', data: tlData.map(d => d.blocked), backgroundColor: 'rgba(244,67,54,0.7)' },
+      { label: '放行', data: tlData.map(d => d.forwarded), backgroundColor: 'rgba(76,175,80,0.7)' },
+      { label: '审计', data: tlData.map(d => d.audited), backgroundColor: 'rgba(255,152,0,0.7)' }
+    ]
+  },
+  options: {
+    responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { labels: { color: '#8b8fa3', font: {size: 11} } } },
+    scales: {
+      x: { ticks: { color: '#8b8fa3', font: {size: 10} }, grid: { color: '#2a2e3a' } },
+      y: { ticks: { color: '#8b8fa3', font: {size: 10} }, grid: { color: '#2a2e3a' }, beginAtZero: true }
+    }
+  }
+});
+
+const mdCtx = document.getElementById('model-chart').getContext('2d');
+const modelChart = new Chart(mdCtx, {
+  type: 'doughnut',
+  data: {
+    labels: mdData.map(d => d.model),
+    datasets: [{ data: mdData.map(d => d.count),
+      backgroundColor: ['#f44336','#ff9800','#4fc3f7','#4caf50','#9c27b0','#e91e63','#00bcd4','#8bc34a'] }]
+  },
+  options: {
+    responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { position: 'right', labels: { color: '#8b8fa3', font: {size: 11} } } }
+  }
+});
+
+let autoRefreshPaused = false;
+const expandedTraces = new Set();
+
+async function doRefresh() {
+  try {
+    const resp = await fetch('/api/data');
+    const data = await resp.json();
+    document.getElementById('stat-total').textContent = data.stats.total;
+    document.getElementById('stat-blocked').textContent = data.stats.blocked_count;
+    document.getElementById('stat-forwarded').textContent = data.stats.forwarded_count;
+    document.getElementById('stat-audited').textContent = data.stats.audited_count;
+
+    const tl = data.stats.timeline;
+    timelineChart.data.labels = tl.map(d => d.minute);
+    timelineChart.data.datasets[0].data = tl.map(d => d.blocked);
+    timelineChart.data.datasets[1].data = tl.map(d => d.forwarded);
+    timelineChart.data.datasets[2].data = tl.map(d => d.audited);
+    timelineChart.update('none');
+
+    const md = data.stats.models;
+    modelChart.data.labels = md.map(d => d.model);
+    modelChart.data.datasets[0].data = md.map(d => d.count);
+    modelChart.update('none');
+
+    // Update host table
+    const hostRows = data.stats.hosts.map(h =>
+      `<tr><td>${escapeHtml(h.host)}</td><td><span class="badge ${h.decision.toLowerCase()}">${h.decision}</span></td><td>${h.count}</td></tr>`
+    ).join('');
+    document.getElementById('host-tbody').innerHTML = hostRows || '<tr><td colspan="3" class="empty">暂无</td></tr>';
+
+    // Update requests
+    renderRequests(data.requests);
+
+    // Update traces
+    renderTraces(data.traces);
+  } catch(e) {
+    document.getElementById('last-update').textContent = '连接失败';
+  }
+}
+
+async function refresh() {
+  if (autoRefreshPaused) return;
+  await doRefresh();
+  document.getElementById('last-update').textContent = '更新于 ' + new Date().toLocaleTimeString();
+}
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
