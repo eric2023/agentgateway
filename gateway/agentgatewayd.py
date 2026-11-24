@@ -1533,6 +1533,7 @@ def main():
     os.makedirs(CERT_DIR, exist_ok=True)
 
     audit_init()
+    load_ca()
     gw_proxy_setup()
     atexit.register(gw_proxy_restore)
     signal.signal(signal.SIGTERM, lambda *_: (gw_proxy_restore(), sys.exit(0)))
