@@ -751,11 +751,6 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
         port = int(port)
         session_id = getattr(self, "_session_id", "unknown")
 
-        # Capture the raw TCP socket NOW — _do_mitm_connect/_handle_tls_tunnel
-        # will reassign self.connection to a TLS-wrapped socket, and the lookup
-        # must read /proc/net/tcp against the original connection.
-        self._start_peer_lookup(self.connection)
-
         # Track network event
         tracker.add_event(session_id, "network", {
             "method": "CONNECT",
@@ -764,7 +759,15 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
         })
 
         if should_mitm(host):
-            self._do_mitm_connect(host, port, session_id)
+            # Capture the raw TCP socket NOW — _do_mitm_connect will reassign
+            # self.connection to a TLS-wrapped socket, and the lookup must
+            # read /proc/net/tcp against the original connection.
+            # Start peer lookup AFTER sending the 200 response to avoid
+            # GIL contention from /proc/*/fd readlink scanning stalling
+            # the response.
+            self._send_connect_ok()
+            self._start_peer_lookup(self.connection)
+            self._do_mitm_connect_after_ok(host, port, session_id)
         else:
             self._do_blind_tunnel(host, port, session_id)
 
@@ -858,12 +861,13 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-    def _do_mitm_connect(self, host, port, session_id):
-        """Establish MITM TLS; fall back to blind tunnel on failure."""
-        # Send 200 Connection Established
+    def _send_connect_ok(self):
+        """Send 200 Connection Established immediately."""
         self.send_response(200, "Connection Established")
         self.end_headers()
 
+    def _do_mitm_connect_after_ok(self, host, port, session_id):
+        """Establish MITM TLS after 200 has been sent; fall back to tunnel."""
         # Generate cert for this host and wrap in TLS
         cert_path, key_path = generate_cert_for_host(host)
 
@@ -878,7 +882,7 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
             # Client rejected our CA (cert pinning, untrusted CA, etc.).
             # Fall back to blind tunnel so traffic still flows.
             log(f"[TLS] MITM failed for {host}, falling back to tunnel: {e}")
-            self._do_blind_tunnel(host, port, session_id, already_handshaked=False)
+            self._do_blind_tunnel(host, port, session_id, already_handshaked=True)
             return
 
         # Now we have a TLS tunnel. Read HTTP requests from inside the tunnel.
