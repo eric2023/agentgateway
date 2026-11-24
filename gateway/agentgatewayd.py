@@ -392,6 +392,8 @@ def detect_ai_response(body_bytes):
 # Everything else is blind-tunneled (no TLS interception, no cert issues).
 AI_HOST_PATTERNS = [
     "ai.uniontech.com",
+    "uosai.uniontech.com",
+    "xiaou.uniontech.com",
     "api.openai.com",
     "api.anthropic.com",
     "api.deepseek.com",
@@ -893,8 +895,13 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
         self._join_peer_lookup(timeout=3.0)
         peer_pid = getattr(self, "_peer_pid", None)
         peer_comm = getattr(self, "_peer_comm", None)
+        peer_app_name = getattr(self, "_peer_app_name", None)
 
+        # Prefer AGENTGATEWAY_APP_NAME (set by trustexec.sh) over the raw
+        # process name — e.g. "uos-ai" instead of "uos-ai-assistan" (truncated).
         effective_app, is_browser_aux = detect_app_source(body_bytes, headers, peer_comm)
+        if peer_app_name and not is_browser_aux:
+            effective_app = peer_app_name
 
         # Browser auxiliary requests (predictions) get a separate session
         effective_session = session_id
@@ -1111,11 +1118,11 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
 
         # ── Non-AI: Forward the request ──
         audit_log({
-            "agent_id": getattr(self, "_agent_id", "unknown"),
-            "app_name": getattr(self, "_app_name", "unknown"),
+            "agent_id": effective_agent,
+            "app_name": effective_app,
             "peer_pid": peer_pid,
             "peer_comm": peer_comm,
-            "session_id": session_id,
+            "session_id": effective_session,
             "event": "http_forward",
             "method": method,
             "host": host,
@@ -1140,9 +1147,9 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
                     "response_detail": resp_detail,
                 })
                 audit_log({
-                    "agent_id": getattr(self, "_agent_id", "unknown"),
-                    "app_name": getattr(self, "_app_name", "unknown"),
-                    "session_id": session_id,
+                    "agent_id": effective_agent,
+                    "app_name": effective_app,
+                    "session_id": effective_session,
                     "event": "ai_response_detected",
                     "host": host,
                     "path": path,
