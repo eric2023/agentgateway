@@ -156,17 +156,21 @@ gcc -shared -fPIC -o gateway/libauditshim.so gateway/libauditshim.c -ldl
 
 ### 3. 安装 CA 证书到浏览器（可选）
 
-如果需要拦截浏览器（如 Chromium）中的 AI 请求：
+如果需要拦截浏览器（如 Chrome）中的 AI 请求，必须将 AgentGateway CA 导入浏览器的 NSS 证书库：
 
 ```bash
-# 方法一：导入到 Chromium NSS 证书库
+# 方法一：系统已安装 certutil（libnss3-tools）
 certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "AgentGateway Root CA" \
   -i certs/ca-cert.pem
 
-# 方法二：通过环境变量（适用于命令行启动的浏览器）
-export SSL_CERT_FILE=$(pwd)/certs/ca-cert.pem
-export NODE_EXTRA_CA_CERTS=$(pwd)/certs/ca-cert.pem
+# 方法二：系统未安装 certutil（无 root 权限）
+# 下载 libnss3-tools .deb 并提取 certutil
+cd /tmp && apt download libnss3-tools && dpkg -x libnss3-tools*.deb nss3-tools
+./nss3-tools/usr/bin/certutil -d sql:$HOME/.pki/nssdb -A -t "C,," \
+  -n "AgentGateway Root CA" -i certs/ca-cert.pem
 ```
+
+> **注意**：导入后需重启浏览器才能生效。`-t "C,,"` 表示信任为 SSL CA（SSL,S/MIME,JAR/XPI）。
 
 > omp、UOS AI、命令行工具（curl/python）不需要此步——trustexec.sh 会注入所需的环境变量。
 
