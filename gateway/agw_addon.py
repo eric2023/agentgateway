@@ -47,7 +47,6 @@ class AgentGatewayAddon:
 
     def __init__(self):
         gw.audit_init()
-        gw.load_ca()
         self.agent_id = os.environ.get(
             "AGENTGATEWAY_AGENT_ID", f"agent-{uuid.uuid4().hex[:8]}"
         )

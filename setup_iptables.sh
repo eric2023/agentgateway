@@ -78,7 +78,7 @@ echo "[setup] cgroup tasks writable by all users"
 # ─── 4. Install system-level CA (mitmproxy CA) ─────────────────────────────
 MITM_CA_DIR="$HOME/.mitmproxy"
 MITM_CA_SRC="$MITM_CA_DIR/mitmproxy-ca-cert.pem"
-CA_DST="/etc/ssl/certs/agentgateway-ca.pem"
+CA_DST="/usr/local/share/ca-certificates/agentgateway-ca.crt"
 
 # Generate mitmproxy CA on first run
 if [[ ! -f "$MITM_CA_SRC" ]]; then
@@ -90,7 +90,7 @@ if [[ -f "$MITM_CA_SRC" ]]; then
     echo "[setup] Installing mitmproxy CA to $CA_DST..."
     cp "$MITM_CA_SRC" "$CA_DST"
     chmod 644 "$CA_DST"
-    update-ca-certificates 2>/dev/null || true
+    update-ca-certificates 2>&1 || true
     echo "[setup] System CA installed"
 else
     echo "[setup] WARNING: $MITM_CA_SRC not found — mitmproxy CA generation failed"
