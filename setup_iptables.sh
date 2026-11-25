@@ -100,7 +100,8 @@ fi
 if command -v certutil &>/dev/null; then
     NSSDB="$HOME/.pki/nssdb"
     mkdir -p "$NSSDB"
-    certutil -d "sql:$NSSDB" -A -t "C," -n "mitmproxy" -i "$MITM_CA_SRC" 2>/dev/null || true
+    certutil -d "sql:$NSSDB" -D -n "AgentGateway Root CA" 2>/dev/null || true
+    certutil -d "sql:$NSSDB" -A -t "C,," -n "mitmproxy" -i "$MITM_CA_SRC" 2>/dev/null || true
     echo "[setup] NSS DB CA installed"
 fi
 

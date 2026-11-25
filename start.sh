@@ -171,7 +171,7 @@ do_status() {
 
 do_setup() {
     echo "[start.sh] Running one-time root setup..."
-    sudo bash "$PROJECT_DIR/setup_iptables.sh"
+    sudo --preserve-env=HOME bash "$PROJECT_DIR/setup_iptables.sh"
 }
 
 # ─── main ───────────────────────────────────────────────────────────────────
