@@ -219,6 +219,14 @@ class AgentGatewayAddon:
         except (OSError, PermissionError):
             pass
 
+        # Fall back to executable basename if AGENTGATEWAY_APP_NAME not set
+        if not app_name and agent_pid:
+            try:
+                exe_path = os.readlink(f"/proc/{agent_pid}/exe")
+                app_name = os.path.basename(exe_path)
+            except (OSError, PermissionError):
+                app_name = agent_comm
+
         with gw._proc_cache_lock:
             gw._proc_cache[peer_port] = (
                 agent_pid, agent_comm, app_name, now,

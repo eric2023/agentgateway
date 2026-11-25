@@ -12,7 +12,7 @@
 # Usage: sudo bash setup_iptables.sh           # setup
 #        sudo bash setup_iptables.sh --cleanup  # remove iptables rules
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IPTABLES="/usr/sbin/iptables-legacy"
@@ -50,13 +50,23 @@ fi
 
 # ─── Cleanup mode ──────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--cleanup" ]]; then
+    if [[ "$EUID" -ne 0 ]]; then
+        echo "[setup] ERROR: --cleanup 需要 root 权限，请用 sudo 运行" >&2
+        echo "[setup]   sudo bash $0 --cleanup" >&2
+        exit 1
+    fi
     echo "[setup] Removing iptables rules..."
+    removed=0
     for port in "${HTTPS_PORTS[@]}"; do
-        $IPTABLES -t nat -D OUTPUT \
+        if $IPTABLES -t nat -D OUTPUT \
             -p tcp --dport "$port" -m cgroup --cgroup "$CLASSID" \
-            -j REDIRECT --to-port "$REDIRECT_PORT" 2>/dev/null || true
+            -j REDIRECT --to-port "$REDIRECT_PORT" 2>/dev/null; then
+            echo "[setup]   removed rule for :$port"
+            removed=$((removed + 1))
+        fi
     done
-    echo "[setup] iptables rules removed (ports: ${HTTPS_PORTS[*]})"
+    echo "[setup] iptables rules removed: $removed (ports: ${HTTPS_PORTS[*]})"
+    echo "[setup] verify: $IPTABLES -t nat -L OUTPUT -n"
     exit 0
 fi
 
