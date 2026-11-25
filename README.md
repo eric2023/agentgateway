@@ -70,8 +70,7 @@ agentgateway/
 ├── gateway/
 │   ├── agentgatewayd.py       # 网关共享模块（CA/L7/审计/连接池）
 │   ├── transparent_proxy.py   # 透明代理（iptables REDIRECT 目标）
-│   ├── gen_ca.py              # CA 证书生成器
-│   └── test_gateway.py        # 单元测试
+│   └── gen_ca.py              # CA 证书生成器
 ├── dashboard/
 │   ├── dashboard.py           # Web 仪表盘
 │   └── dashboard_template.html
@@ -79,12 +78,14 @@ agentgateway/
 ├── start.sh                   # 生命周期管理
 ├── trustexec.sh               # Agent cgroup 纳入
 ├── specs/
-│   └── 方案A_透明代理进程级拦截_4.19内核.md
+│   ├── 方案A_透明代理进程级拦截_4.19内核.md   # 当前方案 spec
+│   └── 方案B_BPF-LSM内核级管控_6.6内核.md     # V25 未来扩展 spec
+├── bpf/                       # BPF-LSM/uprobe 代码（6.6+ 内核未来扩展）
 ├── certs/                     # CA 证书 + 动态签发的主机证书
 ├── audit/
 │   └── audit.jsonl            # 审计日志（JSONL 格式）
 ├── logs/                      # 运行日志
-└── test_agent_interception.py # 拦截测试脚本
+└── docs/superpowers/plans/    # 实施计划
 ```
 
 ## 环境要求
@@ -194,6 +195,14 @@ trustexec 将当前进程写入 cgroup `net_cls/agentgateway/tasks`，Agent 启�
 ### 验证拦截
 
 ```bash
+# 用 trustexec 启动 curl 发送 AI 请求
+./trustexec.sh --app "TestApp" curl -sS \
+  --cacert certs/ca-cert.pem \
+  -X POST https://ai.uniontech.com/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer test-key' \
+  -d '{"model":"glm-5","messages":[{"role":"user","content":"hello"}]}'
+
 # 查看审计日志
 tail -f audit/audit.jsonl | python3 -m json.tool
 
@@ -230,8 +239,9 @@ tail -f audit/audit.jsonl | python3 -m json.tool
   "ts": "2026-11-24T03:30:00.000000+00:00",  // UTC 时间戳
   "event": "ai_request_audited",              // 事件类型
   "decision": "AUDIT",                        // 决策：AUDIT
-  "agent_id": "agent-def456",                 // Agent ID
-  "session_id": "session-abc123",             // 会话 ID
+  "agent_id": "agent-def456",                 // Agent ID（trustexec 设置）
+  "session_id": "session-abc123",             // 会话 ID（trustexec 设置）
+  "app_name": "OMP",                          // 应用名（trustexec --app 设置）
   "method": "POST",                           // HTTP 方法
   "host": "ai.uniontech.com",                 // 目标主机
   "path": "/v1/chat/completions",            // 请求路径
@@ -261,7 +271,6 @@ tail -f audit/audit.jsonl | python3 -m json.tool
 |--------|--------|------|
 | `GATEWAY_HOST` | `127.0.0.1` | CONNECT 代理监听地址（fallback） |
 | `GATEWAY_PORT` | `8443` | CONNECT 代理监听端口（fallback） |
-| `AI_HOST_PATTERNS` | 见源码 | MITM 主机列表（仅 CONNECT 代理路径使用） |
 | `AI_API_PATHS` | `/v1/chat/completions` 等 | AI API 路径模式 |
 | `AI_BODY_SIGNALS` | `model`, `messages` 等 | 请求体 AI 信号 |
 
@@ -285,16 +294,6 @@ echo 0x100001 > /sys/fs/cgroup/net_cls/agentgateway/net_cls.classid
 
 # 允许普通用户写入（trustexec 使用）
 chmod 666 /sys/fs/cgroup/net_cls/agentgateway/tasks
-```
-
-## 测试
-
-```bash
-# 运行拦截测试脚本
-python3 test_agent_interception.py
-
-# 运行网关单元测试
-python3 gateway/test_gateway.py
 ```
 
 ## 停止服务
@@ -321,6 +320,7 @@ sudo bash setup_iptables.sh --cleanup
 
 - [`specs/方案A_透明代理进程级拦截_4.19内核.md`](specs/方案A_透明代理进程级拦截_4.19内核.md) — 透明代理进程级拦截方案（当前实现，适用于 4.19 内核）
 - [`specs/方案B_BPF-LSM内核级管控_6.6内核.md`](specs/方案B_BPF-LSM内核级管控_6.6内核.md) — BPF-LSM 内核级管控方案（V25，含文件访问管控，适用于 6.6+ 内核）
+
 ## 开源许可
 
 本项目基于 [Apache License 2.0](LICENSE) 开源。
