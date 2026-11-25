@@ -5,7 +5,7 @@
 # One-time root setup for AgentGateway transparent proxy:
 #   1. modprobe xt_cgroup
 #   2. Create cgroup net_cls/agentgateway (classid 0x100001)
-#   3. chmod 666 tasks (allow non-root trustexec to write)
+#   3. chmod 666 tasks (allow non-root agw-admit to write)
 #   4. Install system-level CA
 #   5. Set iptables-legacy REDIRECT rule
 #

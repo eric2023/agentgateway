@@ -199,8 +199,8 @@ def _lookup_peer(client_socket):
     agent_id = None
     session_id = None
     # Read AGENTGATEWAY_* from the DIRECT process (pid), not the resolved
-    # agent. trustexec.sh exec's the command, so the direct process (e.g.
-    # curl) inherits trustexec's environment. The parent agent process
+    # agent. agw-admit.sh exec's the command, so the direct process (e.g.
+    # curl) inherits agw-admit's environment. The parent agent process
     # (e.g. omp) doesn't have these vars.
     try:
         with open(f"/proc/{pid}/environ", "rb") as f:

@@ -29,7 +29,7 @@ enum agw_op {
     OP_BPF            = 4,
 };
 
-/* identity map value: cgroup_id -> agent identity (written by trustexec helper) */
+/* identity map value: cgroup_id -> agent identity (written by agw-admit helper) */
 struct agent_identity {
     __u32 agent_id_len;
     __u32 session_id_len;

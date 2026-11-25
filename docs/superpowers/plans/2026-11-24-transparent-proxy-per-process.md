@@ -4,7 +4,7 @@
 
 **Goal:** 用 iptables REDIRECT + cgroup net_cls 进程级隔离替换环境注入方式，实现零改造、不可绕过的 Agent HTTPS 请求拦截。
 
-**Architecture:** trustexec 将 Agent 进程写入 cgroup net_cls（classid 0x100001），iptables-legacy 匹配 cgroup 重定向 :443 到 :8444，transparent_proxy.py MITM 全部流量并复用 agentgatewayd 的 CA/L7/审计/连接池。系统级 CA 安装后全局信任。
+**Architecture:** agw-admit 将 Agent 进程写入 cgroup net_cls（classid 0x100001），iptables-legacy 匹配 cgroup 重定向 :443 到 :8444，transparent_proxy.py MITM 全部流量并复用 agentgatewayd 的 CA/L7/审计/连接池。系统级 CA 安装后全局信任。
 
 **Tech Stack:** Python 3.8+ stdlib + cryptography, iptables-legacy, cgroup v1 net_cls, systemd
 
@@ -27,7 +27,7 @@
 |---|---|---|
 | `gateway/transparent_proxy.py` | 透明代理，MITM 全部 cgroup 流量 | 修改 |
 | `gateway/agentgatewayd.py` | 共享模块：CA/L7/审计/连接池 | 修改（删除 gsettings 代码） |
-| `trustexec.sh` | Agent cgroup 纳入 | 改造 |
+| `agw-admit.sh` | Agent cgroup 纳入 | 改造 |
 | `setup_iptables.sh` | 一次性 root 设置 | 新建 |
 | `start.sh` | 生命周期管理 | 修改 |
 | `specs/方案A_透明代理进程级拦截_4.19内核.md` | 新 spec | 已写 |
@@ -307,28 +307,28 @@ git commit -m "refactor: transparent_proxy 全部MITM + poll() + 连接池"
 
 ---
 
-### Task 3: 改造 trustexec.sh — cgroup 纳入
+### Task 3: 改造 agw-admit.sh — cgroup 纳入
 
 **Files:**
-- Modify: `trustexec.sh`
+- Modify: `agw-admit.sh`
 
 **Interfaces:**
 - Consumes: `/sys/fs/cgroup/net_cls/agentgateway/tasks`（需 setup 脚本创建并 chmod 666）
 - Produces: Agent 进程在 cgroup 内，设置 AGENTGATEWAY_AGENT_ID/SESSION_ID 环境变量
 
-- [ ] **Step 1: 重写 trustexec.sh**
+- [ ] **Step 1: 重写 agw-admit.sh**
 
-将整个 trustexec.sh 替换为：
+将整个 agw-admit.sh 替换为：
 ```bash
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Uniontech Software Technology Co., Ltd.
 # Licensed under the Apache License, Version 2.0 (the "License");
 #
-# AgentGateway trustexec — Agent wrapper that admits the process into
+# AgentGateway agw-admit — Agent wrapper that admits the process into
 # the iptables net_cls cgroup for transparent proxy interception.
 #
-# Usage: trustexec.sh [--app <name>] [--agent-id <uuid>] <command> [args...]
+# Usage: agw-admit.sh [--app <name>] [--agent-id <uuid>] <command> [args...]
 #
 # Sets:
 #   AGENTGATEWAY_AGENT_ID     → unique per-launch agent ID
@@ -371,7 +371,7 @@ while [[ $# -gt 0 ]]; do
             break
             ;;
         -*)
-            echo "[trustexec] Unknown option: $1" >&2
+            echo "[agw-admit] Unknown option: $1" >&2
             exit 1
             ;;
         *)
@@ -402,8 +402,8 @@ export AGENTGATEWAY_APP_NAME="$APP_NAME"
 if [[ -w "$CGROUP_TASKS" ]]; then
     echo $$ > "$CGROUP_TASKS"
 else
-    echo "[trustexec] WARNING: cannot write to $CGROUP_TASKS" >&2
-    echo "[trustexec] Run setup_iptables.sh first to create the cgroup." >&2
+    echo "[agw-admit] WARNING: cannot write to $CGROUP_TASKS" >&2
+    echo "[agw-admit] Run setup_iptables.sh first to create the cgroup." >&2
 fi
 
 echo "[agentgateway] Agent ID:   $AGENT_ID"
@@ -416,18 +416,18 @@ echo "[agentgateway] ───────────────────�
 exec "$@"
 ```
 
-- [ ] **Step 2: 验证 trustexec.sh 语法**
+- [ ] **Step 2: 验证 agw-admit.sh 语法**
 
 ```bash
-bash -n trustexec.sh
+bash -n agw-admit.sh
 ```
 Expected: 无输出（语法正确）。
 
 - [ ] **Step 3: 提交**
 
 ```bash
-git add trustexec.sh
-git commit -m "refactor: trustexec 从环境注入改为 cgroup net_cls 纳入"
+git add agw-admit.sh
+git commit -m "refactor: agw-admit 从环境注入改为 cgroup net_cls 纳入"
 ```
 
 ---
@@ -452,7 +452,7 @@ cat > setup_iptables.sh << 'SCRIPT'
 # One-time root setup for AgentGateway transparent proxy:
 #   1. modprobe xt_cgroup
 #   2. Create cgroup net_cls/agentgateway (classid 0x100001)
-#   3. chmod 666 tasks (allow non-root trustexec to write)
+#   3. chmod 666 tasks (allow non-root agw-admit to write)
 #   4. Install system-level CA
 #   5. Set iptables-legacy REDIRECT rule
 
@@ -749,7 +749,7 @@ git commit -m "refactor: 删除 agentgatewayd gsettings 代理管理（透明代
 将 README 中方案A/B并存的描述改为统一方案：
 - 移除方案A（用户态验证）和方案B（BPF-LSM 6.6内核）并存的描述
 - 描述新方案：iptables REDIRECT + cgroup net_cls + 透明代理 + 系统级 CA
-- 更新部署步骤为 `./start.sh setup` + `./start.sh start` + `./trustexec.sh --app xxx <cmd>`
+- 更新部署步骤为 `./start.sh setup` + `./start.sh start` + `./agw-admit.sh --app xxx <cmd>`
 - 更新文件清单
 
 - [ ] **Step 2: 提交**
@@ -774,11 +774,11 @@ timeout 3 python3 gateway/transparent_proxy.py 2>&1
 ```
 Expected: `[TPROXY] AgentGateway transparent proxy listening on 127.0.0.1:8444`
 
-- [ ] **Step 2: 验证 trustexec.sh 语法和帮助**
+- [ ] **Step 2: 验证 agw-admit.sh 语法和帮助**
 
 ```bash
-bash -n trustexec.sh
-./trustexec.sh 2>&1 | head -3
+bash -n agw-admit.sh
+./agw-admit.sh 2>&1 | head -3
 ```
 Expected: 显示 Usage。
 
@@ -807,6 +807,6 @@ Expected: `OK`
 - [ ] **Step 6: 验证无残留引用**
 
 ```bash
-grep -r "libauditshim\|_should_mitm\|gw_proxy_setup\|gw_proxy_restore" gateway/ start.sh trustexec.sh 2>/dev/null
+grep -r "libauditshim\|_should_mitm\|gw_proxy_setup\|gw_proxy_restore" gateway/ start.sh agw-admit.sh 2>/dev/null
 ```
 Expected: 无输出（或仅在 agentgatewayd.py 内保留 `should_mitm` 定义供 CONNECT 路径，但 transparent_proxy 不调用）。

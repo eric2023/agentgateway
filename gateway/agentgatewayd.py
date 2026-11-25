@@ -152,7 +152,7 @@ class ToolCallTracker:
     """Tracks the chain of tool calls within an agent session.
 
     Each agent process gets a session_id (from env var AGENTGATEWAY_SESSION_ID
-    set by trustexec, or auto-generated). The tracker correlates:
+    set by agw-admit, or auto-generated). The tracker correlates:
     - File reads (from audited syscalls or network requests)
     - AI model calls (from intercepted HTTPS)
     - Tool executions (from audited execve)
@@ -972,7 +972,7 @@ class MITMProxyHandler(http.server.BaseHTTPRequestHandler):
         peer_comm = getattr(self, "_peer_comm", None)
         peer_app_name = getattr(self, "_peer_app_name", None)
 
-        # Prefer AGENTGATEWAY_APP_NAME (set by trustexec.sh) over the raw
+        # Prefer AGENTGATEWAY_APP_NAME (set by agw-admit.sh) over the raw
         # process name — e.g. "uos-ai" instead of "uos-ai-assistan" (truncated).
         effective_app, is_browser_aux = detect_app_source(body_bytes, headers, peer_comm)
         if peer_app_name and not is_browser_aux:

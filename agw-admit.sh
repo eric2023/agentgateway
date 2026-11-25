@@ -3,14 +3,15 @@
 # Copyright (c) 2026 Uniontech Software Technology Co., Ltd.
 # Licensed under the Apache License, Version 2.0 (the "License");
 #
-# AgentGateway trustexec — Agent wrapper that admits the process into
+# AgentGateway agw-admit — Agent wrapper that admits the process into
 # the iptables net_cls cgroup for transparent proxy interception.
 #
-# Usage: trustexec.sh [--app <name>] [--agent-id <uuid>] <command> [args...]
+# Usage: agw-admit.sh [--app <name>] [--agent-id <uuid>] <command> [args...]
 #
 # Sets:
-#   AGENTGATEWAY_AGENT_ID     → unique per-launch agent ID
-#   AGENTGATEWAY_SESSION_ID   → unique per-launch session ID
+#   AGENTGATEWAY_APP_NAME    → application name (for audit attribution)
+#   AGENTGATEWAY_AGENT_ID    → unique per-launch agent ID
+#   AGENTGATEWAY_SESSION_ID  → unique per-launch session ID
 #
 # The process is written into /sys/fs/cgroup/net_cls/agentgateway/tasks,
 # causing its :443 outbound traffic to be redirected by iptables to the
@@ -40,16 +41,12 @@ while [[ $# -gt 0 ]]; do
             SESSION_ID="$2"
             shift 2
             ;;
-        --bpf)
-            # Ignored: BPF mode was for 方案B (6.6 kernel), not applicable on 4.19
-            shift
-            ;;
         --)
             shift
             break
             ;;
         -*)
-            echo "[trustexec] Unknown option: $1" >&2
+            echo "[agw-admit] Unknown option: $1" >&2
             exit 1
             ;;
         *)
@@ -72,16 +69,16 @@ if [[ -z "$SESSION_ID" ]]; then
 fi
 
 # Set AgentGateway identity (read by transparent_proxy.py for audit attribution)
+export AGENTGATEWAY_APP_NAME="$APP_NAME"
 export AGENTGATEWAY_AGENT_ID="$AGENT_ID"
 export AGENTGATEWAY_SESSION_ID="$SESSION_ID"
-export AGENTGATEWAY_APP_NAME="$APP_NAME"
 
 # Admit this process into the net_cls cgroup
 if [[ -w "$CGROUP_TASKS" ]]; then
     echo $$ > "$CGROUP_TASKS"
 else
-    echo "[trustexec] WARNING: cannot write to $CGROUP_TASKS" >&2
-    echo "[trustexec] Run setup_iptables.sh first to create the cgroup." >&2
+    echo "[agw-admit] WARNING: cannot write to $CGROUP_TASKS" >&2
+    echo "[agw-admit] Run setup_iptables.sh first to create the cgroup." >&2
 fi
 
 echo "[agentgateway] Agent ID:   $AGENT_ID"

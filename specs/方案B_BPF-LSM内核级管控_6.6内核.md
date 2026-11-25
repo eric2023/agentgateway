@@ -43,7 +43,7 @@ graph TB
         Cgroup["cgroup v2<br/>进程树身份 / 生命周期"]
     end
 
-    App -->|"trustexec 或 BPF_LSM_CGROUP 纳入"| TaskStorage
+    App -->|"agw-admit 或 BPF_LSM_CGROUP 纳入"| TaskStorage
     App -->|"网络请求"| Nft
     Nft -->|"TPROXY 重定向"| GW
     App -->|"TLS 明文"| BPFUprobe
@@ -127,7 +127,7 @@ graph LR
 ### 3.3 进程身份模型：BPF task storage
 
 ```
-trustexec 启动 Agent
+agw-admit 启动 Agent
   → bpf_task_storage_get(task, agent_map, BPF_LOCAL_STORAGE_GET_F_CREATE)
   → 写入: { agent_id, session_id, app_name, cgroup_id, start_time }
   → 子进程 fork 时 security_task_alloc hook → 自动复制 task storage
@@ -137,11 +137,11 @@ trustexec 启动 Agent
 
 **与方案 A 的差异**: 方案 A 用环境变量（可篡改）；方案 B 用 BPF task storage（内核内，不可篡改）。
 
-### 3.4 纳入机制：trustexec + BPF_LSM_CGROUP
+### 3.4 纳入机制：agw-admit + BPF_LSM_CGROUP
 
-**路径 A: trustexec 启动器（精确纳入）**
+**路径 A: agw-admit 启动器（精确纳入）**
 ```
-trustexec --agent-id <uuid> --app <agent-app> [args...]
+agw-admit --agent-id <uuid> --app <agent-app> [args...]
   1. 创建 cgroup v2: /sys/fs/cgroup/agentgateway/agents/<agent-id>
   2. echo $$ > cgroup.procs
   3. bpf_task_storage 写入 agent_id/session_id
@@ -157,7 +157,7 @@ BPF-LSM 程序 attach 到 /sys/fs/cgroup/agentgateway/agents/ cgroup
   → 不需要 LD_PRELOAD
 ```
 
-**互补**: trustexec 精确注入身份 + Landlock；BPF_LSM_CGROUP 兜底防绕过。
+**互补**: agw-admit 精确注入身份 + Landlock；BPF_LSM_CGROUP 兜底防绕过。
 
 ### 3.5 决策模型
 
@@ -338,7 +338,7 @@ graph LR
 | cert pinning | ⚠️ 沙箱内能绕 | ✅ | uprobe 取明文; BPF-LSM 拒连接 |
 | 自实现 TLS (Go) | ⚠️ 大概率审计 | ✅ | Go 通常信任系统 CA; 不信任 → BPF-LSM 拒绝 |
 | 端到端自定义加密 | ❌ 不可见 | ⚠️ 内容不可见但连接可拦 | BPF-LSM 限制仅允许本地网关 |
-| 非 trustexec 启动 | ❌ 漏 | ✅ | BPF_LSM_CGROUP 按 cgroup 施加 |
+| 非 agw-admit 启动 | ❌ 漏 | ✅ | BPF_LSM_CGROUP 按 cgroup 施加 |
 | Agent 伪造身份 | ✅ 可伪造 | ❌ 不可 | BPF task storage 内核内 |
 | Agent 卸载 LD_PRELOAD | ✅ 可卸载 | ❌ 不可 | BPF uprobe 内核内 |
 | Agent 杀网关进程 | ✅ 可杀 | ❌ 不可 | BPF-LSM security_bpf 自保护 |
@@ -371,7 +371,7 @@ graph TB
         end
 
         CgroupA["cgroup v2<br/>/sys/fs/cgroup/agentgateway/agents/"]
-        Agent1 & Agent2 & Agent3 -->|"trustexec 或自动纳入"| CgroupA
+        Agent1 & Agent2 & Agent3 -->|"agw-admit 或自动纳入"| CgroupA
         CgroupA --> BPFProg
         BPFProg --> BPFMap
         BPFProg --> RingBuf
@@ -420,15 +420,15 @@ python3 dashboard/dashboard.py > logs/dashboard.log 2>&1 &
 # 7. 启动审计消费者（方案 B 新增）
 # python3 bpf/audit_consumer.py &
 
-# 8. 通过 trustexec 启动 Agent（增加 cgroup + Landlock）
-./trustexec.sh --app OMP /path/to/omp
+# 8. 通过 agw-admit 启动 Agent（增加 cgroup + Landlock）
+./agw-admit.sh --app OMP /path/to/omp
 ```
 
 ## 11. 落地路线图
 
 ### P0 — 透明代理 + L7 识别（复用方案 A，✅ 已完成）
 - [x] `agentgatewayd` MITM 代理 + L7 AI 识别
-- [x] CA 证书生成 + 环境变量信任注入（trustexec.sh）
+- [x] CA 证书生成 + 环境变量信任注入（agw-admit.sh）
 - [x] HTTPS_PROXY 环境变量重定向
 - [x] 应用自动识别（/proc 父进程链遍历）
 - [x] omp PI_PROXY 代理机制
@@ -439,14 +439,14 @@ python3 dashboard/dashboard.py > logs/dashboard.log 2>&1 &
 - [x] BPF-LSM 程序: `socket_connect` / `file_open`(lsm.s) / `bprm_check_security`
 - [x] cgroup v2 身份模型: `identity_map`(cgroup_id→identity) + `agent_admit`（内核内不可篡改，替代 task storage）
 - [x] BPF ring buffer: 审计事件通道（`audit_consumer` → audit.jsonl）
-- [x] `trustexec` 启动器 `--bpf` 分支（cgroup 纳入 + Landlock 辅助）
+- [x] `agw-admit` 启动器 `--bpf` 分支（cgroup 纳入 + Landlock 辅助）
 - [x] 用户态审计消费者
 - [ ] BPF map 规则匹配（rules_map 结构就绪，当前用 config 默认策略）
-- [ ] DDE 启动链修改（自动套用 trustexec）
+- [ ] DDE 启动链修改（自动套用 agw-admit）
 
 ### P2 — 文件边界（⚠️ Landlock 不可用，✅ 改用 BPF-LSM 已实施）
 - [x] 文件强制边界: `lsm.s/file_open` + `bpf_d_path`，写白名单外 → `-EPERM`
-- [x] 非 trustexec 启动的 Agent 也能被管控（cgroup 纳入 + `agent_admit`）
+- [x] 非 agw-admit 启动的 Agent 也能被管控（cgroup 纳入 + `agent_admit`）
 - [ ] MCP 子进程纳入验证
 
 > 本机内核 `CONFIG_SECURITY_LANDLOCK=n`（非 boot 参数，需重编内核），Landlock ABI v3 不可用；改用 spec 主机制的 BPF-LSM `file_open`。
@@ -475,7 +475,7 @@ python3 dashboard/dashboard.py > logs/dashboard.log 2>&1 &
 - `gateway/gen_ca.py` — CA 生成
 - `gateway/test_gateway.py` — 单元测试
 - `dashboard/dashboard.py` — Web 仪表盘
-- `trustexec.sh` — 包装器（增加 cgroup + Landlock 调用）
+- `agw-admit.sh` — 包装器（增加 cgroup + Landlock 调用）
 
 方案 A 的以下组件**被内核态替代**：
 - `HTTPS_PROXY` env var → nftables TPROXY + BPF-LSM socket_connect
@@ -488,6 +488,6 @@ python3 dashboard/dashboard.py > logs/dashboard.log 2>&1 &
 1. **内核能力确认**: `cat /sys/kernel/security/lsm` 包含 `bpf`; `zcat /proc/config.gz | grep BPF_LSM`（✅ 已验证）
 2. **P0 验证**: 复用方案 A 网关，确认 omp/UOS AI 流量被审计（✅ 已验证）
 3. **P1 验证**: 加载 BPF-LSM 程序，确认受管 Agent 直连 443 → 内核内 DENY（✅ 已验证）
-4. **P2 验证**: 非 trustexec 启动的 Agent 进入 cgroup → 策略自动生效；写白名单外 → -EPERM（✅ 已验证）
+4. **P2 验证**: 非 agw-admit 启动的 Agent 进入 cgroup → 策略自动生效；写白名单外 → -EPERM（✅ 已验证）
 5. **P3 验证**: nftables redirect 替代 HTTPS_PROXY → SNI MITM 审计；uprobe 取到明文（✅ 已验证）
 6. **P4 验证**: Agent 执行高风险程序 → seccomp 挂起 → notifier 同步 DENY/ALLOW（✅ 已验证）

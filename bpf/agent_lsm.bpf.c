@@ -3,7 +3,7 @@
 // AgentGateway BPF-LSM enforcement sandbox (方案 B, P1).
 //
 // Attached to the `bpf` LSM (global attach). A process is "managed" when its
-// cgroup id is present in identity_map, which trustexec's helper populates
+// cgroup id is present in identity_map, which agw-admit's helper populates
 // after creating the per-agent cgroup. This is the forge-proof identity that
 // replaces 方案 A's environment variables (which any agent can spoof).
 //

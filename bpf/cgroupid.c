@@ -4,7 +4,7 @@
 // bpf_get_current_cgroup_id() returns in the BPF program.
 //
 // On cgroup2 the kernfs node id (returned by name_to_handle_at) is the cgroup
-// id; trustexec's helper keys identity_map on this value.
+// id; agw-admit's helper keys identity_map on this value.
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
