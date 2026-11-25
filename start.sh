@@ -184,16 +184,30 @@ case "${1:-start}" in
     restart) do_start ;;
     status)  do_status ;;
     setup)   do_setup ;;
+    -h|--help|"")
+        cat <<'EOF'
+AgentGateway 生命周期管理脚本
+
+Usage: ./start.sh {start|stop|restart|status|fg|setup}
+
+命令:
+  start     启动 mitmproxy + dashboard（后台，默认）
+  -d        同 start（daemon 模式）
+  fg        前台运行（Ctrl+C 停止两者）
+  stop      停止 mitmproxy + dashboard
+  restart   重启两者
+  status    查看运行状态
+  setup     一次性 root 设置（iptables + cgroup + CA）
+  -h, --help  显示此帮助信息
+
+端口:
+  mitmproxy (transparent):  127.0.0.1:8444
+  Dashboard:                http://127.0.0.1:9090
+EOF
+        ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|fg|setup}"
-        echo
-        echo "  start    Start mitmproxy + dashboard (default)"
-        echo "  -d       Same as start (daemon mode)"
-        echo "  fg       Start in foreground (Ctrl+C to stop both)"
-        echo "  stop     Stop both"
-        echo "  restart  Restart both"
-        echo "  status   Show running status"
-        echo "  setup    One-time root setup (iptables + cgroup + CA)"
+        echo "Usage: $0 {start|stop|restart|status|fg|setup|-h}"
+        echo "  Run '$0 -h' for full help."
         exit 1
         ;;
 esac

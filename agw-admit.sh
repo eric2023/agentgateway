@@ -29,6 +29,31 @@ SESSION_ID=""
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            cat <<'EOF'
+AgentGateway agw-admit — 将进程纳入 cgroup 拦截的 Agent 包装器
+
+Usage: agw-admit.sh [--app <名称>] [--agent-id <uuid>] [--session-id <uuid>] <command> [args...]
+
+选项:
+  --app <名称>       应用名称（用于审计归属，默认 "unknown"）
+  --agent-id <uuid>  Agent ID（不指定则自动生成）
+  --session-id <uuid> 会话 ID（不指定则自动生成）
+  -h, --help         显示此帮助信息
+  --                 结束选项解析，后续参数作为命令执行
+
+示例:
+  agw-admit.sh --app "OMP" /home/ut000520@uos/.local/bin/omp
+  agw-admit.sh --app "TestApp" curl -sS https://httpbin.org/get
+  agw-admit.sh --app "MyAgent" python3 my_agent.py
+
+说明:
+  将当前进程写入 cgroup net_cls/agentgateway/tasks，使其 :443/:8443/:9443
+  出向流量被 iptables REDIRECT 到 mitmproxy :8444 透明代理。
+  Agent 零改造，无需设置任何环境变量。
+EOF
+            exit 0
+            ;;
         --app)
             APP_NAME="$2"
             shift 2

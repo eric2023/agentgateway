@@ -23,6 +23,31 @@ REDIRECT_PORT=8444
 # Common HTTPS ports used by AI API endpoints
 HTTPS_PORTS=(443 8443 9443)
 
+# ─── Help ──────────────────────────────────────────────────────────────────
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    cat <<'EOF'
+AgentGateway 一次性 root 设置脚本
+
+Usage: sudo bash setup_iptables.sh [选项]
+
+选项:
+  (无)        执行一次性设置（modprobe + cgroup + iptables + CA）
+  --cleanup   移除 iptables REDIRECT 规则
+  -h, --help  显示此帮助信息
+
+执行内容:
+  1. modprobe xt_cgroup — 加载 cgroup 匹配内核模块
+  2. 创建 cgroup /sys/fs/cgroup/net_cls/agentgateway（classid 0x100001）
+  3. chmod 666 tasks — 允许普通用户 agw-admit 写入
+  4. 安装 mitmproxy CA 到 /etc/ssl/certs/agentgateway-ca.pem
+  5. 设置 iptables-legacy REDIRECT 规则（:443 :8443 :9443 → :8444）
+
+验证:  /usr/sbin/iptables-legacy -t nat -L OUTPUT -n
+清理:  sudo bash setup_iptables.sh --cleanup
+EOF
+    exit 0
+fi
+
 # ─── Cleanup mode ──────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--cleanup" ]]; then
     echo "[setup] Removing iptables rules..."
