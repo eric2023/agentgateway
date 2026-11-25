@@ -7,10 +7,10 @@
 #   2. Create cgroup net_cls/agentgateway (classid 0x100001)
 #   3. chmod 666 tasks (allow non-root agw-admit to write)
 #   4. Install system-level CA
-#   5. Set iptables-legacy REDIRECT rule
+#   5. Set iptables-legacy REDIRECT rules for common HTTPS ports
 #
 # Usage: sudo bash setup_iptables.sh           # setup
-#        sudo bash setup_iptables.sh --cleanup  # remove iptables rule
+#        sudo bash setup_iptables.sh --cleanup  # remove iptables rules
 
 set -euo pipefail
 
@@ -20,13 +20,18 @@ CGROUP_DIR="/sys/fs/cgroup/net_cls/agentgateway"
 CLASSID="0x100001"
 REDIRECT_PORT=8444
 
+# Common HTTPS ports used by AI API endpoints
+HTTPS_PORTS=(443 8443 9443)
+
 # ─── Cleanup mode ──────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--cleanup" ]]; then
-    echo "[setup] Removing iptables rule..."
-    $IPTABLES -t nat -D OUTPUT \
-        -p tcp --dport 443 -m cgroup --cgroup "$CLASSID" \
-        -j REDIRECT --to-port "$REDIRECT_PORT" 2>/dev/null || true
-    echo "[setup] iptables rule removed"
+    echo "[setup] Removing iptables rules..."
+    for port in "${HTTPS_PORTS[@]}"; do
+        $IPTABLES -t nat -D OUTPUT \
+            -p tcp --dport "$port" -m cgroup --cgroup "$CLASSID" \
+            -j REDIRECT --to-port "$REDIRECT_PORT" 2>/dev/null || true
+    done
+    echo "[setup] iptables rules removed (ports: ${HTTPS_PORTS[*]})"
     exit 0
 fi
 
@@ -66,20 +71,21 @@ if command -v certutil &>/dev/null; then
     echo "[setup] NSS DB CA installed"
 fi
 
-# ─── 5. Set iptables rule ──────────────────────────────────────────────────
-echo "[setup] Setting iptables-legacy REDIRECT rule..."
+# ─── 5. Set iptables rules ─────────────────────────────────────────────────
+echo "[setup] Setting iptables-legacy REDIRECT rules for ports: ${HTTPS_PORTS[*]}..."
 
-# Remove old rule if exists (ignore errors)
-$IPTABLES -t nat -D OUTPUT \
-    -p tcp --dport 443 -m cgroup --cgroup "$CLASSID" \
-    -j REDIRECT --to-port "$REDIRECT_PORT" 2>/dev/null || true
+for port in "${HTTPS_PORTS[@]}"; do
+    # Remove old rule if exists (ignore errors)
+    $IPTABLES -t nat -D OUTPUT \
+        -p tcp --dport "$port" -m cgroup --cgroup "$CLASSID" \
+        -j REDIRECT --to-port "$REDIRECT_PORT" 2>/dev/null || true
+    # Add rule
+    $IPTABLES -t nat -A OUTPUT \
+        -p tcp --dport "$port" -m cgroup --cgroup "$CLASSID" \
+        -j REDIRECT --to-port "$REDIRECT_PORT"
+done
 
-# Add rule
-$IPTABLES -t nat -A OUTPUT \
-    -p tcp --dport 443 -m cgroup --cgroup "$CLASSID" \
-    -j REDIRECT --to-port "$REDIRECT_PORT"
-
-echo "[setup] iptables rule set: cgroup $CLASSID :443 → :$REDIRECT_PORT"
+echo "[setup] iptables rules set: cgroup $CLASSID ports ${HTTPS_PORTS[*]} → :$REDIRECT_PORT"
 echo "[setup] ─────────────────────────────────────"
 echo "[setup] Setup complete."
 echo "[setup] Verify:   $IPTABLES -t nat -L OUTPUT -n"

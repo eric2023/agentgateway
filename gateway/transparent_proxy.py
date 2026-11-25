@@ -4,15 +4,17 @@
 #
 # AgentGateway transparent proxy (方案 A).
 #
-# Accepts iptables-REDIRECTed :443 traffic from cgroup-isolated Agent
-# processes, extracts the SNI hostname from the TLS ClientHello, MITMs
-# all connections (reusing agentgatewayd's CA/L7/audit/connection pool).
-# Runs on :8444.
+# Accepts iptables-REDIRECTed HTTPS traffic (ports 443/8443/9443/...) from
+# cgroup-isolated Agent processes, extracts the SNI hostname from the TLS
+# ClientHello, MITMs all connections (reusing agentgatewayd's
+# CA/L7/audit/connection pool).  Runs on :8444.
 #
-# iptables-legacy (root), redirecting cgroup 0x100001 :443 -> :8444:
-#   /usr/sbin/iptables-legacy -t nat -A OUTPUT \
-#     -p tcp --dport 443 -m cgroup --cgroup 0x100001 \
-#     -j REDIRECT --to-port 8444
+# iptables-legacy (root), redirecting cgroup 0x100001 HTTPS → :8444:
+#   for port in 443 8443 9443; do
+#     /usr/sbin/iptables-legacy -t nat -A OUTPUT \
+#       -p tcp --dport $port -m cgroup --cgroup 0x100001 \
+#       -j REDIRECT --to-port 8444
+#   done
 #
 # All traffic reaching this proxy is from cgroup-isolated Agent processes,
 # so every connection is MITM'd — no AI_HOST_PATTERNS filtering needed.
@@ -107,22 +109,19 @@ def _redact_headers(headers):
 def _lookup_peer(client_socket):
     """Identify the agent process on the other end of a REDIRECTed connection.
 
-    Unlike the CONNECT proxy (where the client connects to :8443), with
-    iptables REDIRECT the client thinks it's connecting to :443 — the kernel
-    transparently redirects to :8444. So in /proc/net/tcp the client-side
-    socket shows remote=<orig_dst_ip>:443, not remote=127.0.0.1:8444.
+    With iptables REDIRECT the client thinks it's connecting to the original
+    destination (e.g. :443, :8443, :9443) — the kernel transparently redirects
+    to :8444. So in /proc/net/tcp the client-side socket shows
+    remote=<orig_dst_ip>:<orig_dst_port>, not remote=127.0.0.1:8444.
 
     Returns (pid, comm, app_name, agent_id, session_id) or all-None.
     """
     try:
         peer_addr = client_socket.getpeername()
-        local_addr = client_socket.getsockname()
     except OSError:
         return None, None, None, None, None
 
-    peer_ip = peer_addr[0]
     peer_port = peer_addr[1]
-    local_port = local_addr[1]
     now = time.time()
     # Check cache
     with gw._proc_cache_lock:
@@ -132,8 +131,9 @@ def _lookup_peer(client_socket):
 
     # The server-side socket (local=:8444, remote=client:peer_port) gives us
     # the inode, but that inode belongs to the proxy process. We need the
-    # CLIENT-side socket: local=client:peer_port, remote=<orig_dst>:443.
-    # With REDIRECT, the client's remote port is always 443.
+    # CLIENT-side socket: local=client:peer_port, remote=<orig_dst>:<port>.
+    # Match by local port only — the remote port varies (443, 8443, 9443, ...).
+    # Exclude our own listening socket (local=:8444) to avoid false matches.
     client_inode = None
     try:
         with open("/proc/net/tcp") as f:
@@ -148,11 +148,14 @@ def _lookup_peer(client_socket):
                 if state != "01":  # ESTABLISHED
                     continue
                 l_port = int(local_hex.split(":")[1], 16)
+                if l_port != peer_port:
+                    continue
+                # Skip the proxy's own listening port (8444)
                 r_port = int(rem_hex.split(":")[1], 16)
-                # Client side: local=client_port, remote=:443
-                if l_port == peer_port and r_port == 443:
-                    client_inode = parts[9]
-                    break
+                if r_port == PORT:
+                    continue
+                client_inode = parts[9]
+                break
     except OSError:
         return None, None, None, None, None
 
@@ -408,7 +411,7 @@ def _blind_tunnel(client, host, port, initial=b""):
         except OSError:
             pass
 
-def _mitm(client, host, rfile_hint=b""):
+def _mitm(client, host, orig_port=443, rfile_hint=b""):
     cert_path, key_path = gw.generate_cert_for_host(host)
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -441,7 +444,7 @@ def _mitm(client, host, rfile_hint=b""):
         resp_body = b""
         fwd_ok = True
         try:
-            status, resp_headers, resp_body = _forward(host, 443, method, path, headers, body)
+            status, resp_headers, resp_body = _forward(host, orig_port, method, path, headers, body)
         except Exception as e:
             fwd_ok = False
             gw.log(f"[TPROXY] forward {host}{path} failed: {e}")
@@ -458,7 +461,7 @@ def _mitm(client, host, rfile_hint=b""):
                 "request_id": request_id,
                 "method": method,
                 "host": host,
-                "port": 443,
+                "port": orig_port,
                 "path": path,
                 "model": detail.get("model", ""),
                 "confidence": confidence,
@@ -517,8 +520,8 @@ def _handle(client, addr):
                 _blind_tunnel(client, orig_ip, orig_port)
             return
         # All cgroup-isolated traffic is MITM'd — no host filtering needed.
-        gw.log(f"[TPROXY] MITM {sni} from {addr[0]}:{addr[1]}")
-        _mitm(client, sni)
+        gw.log(f"[TPROXY] MITM {sni}:{orig_port} from {addr[0]}:{addr[1]}")
+        _mitm(client, sni, orig_port=orig_port)
     except (OSError, ssl.SSLError):
         pass
     finally:
