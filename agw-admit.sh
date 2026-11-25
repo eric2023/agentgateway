@@ -76,13 +76,21 @@ EOF
             if [[ -z "$pids" ]]; then
                 echo "[agentgateway]   （无）"
             else
-                printf "%-8s %-16s %s\n" "PID" "进程名" "完整路径"
-                printf "%-8s %-16s %s\n" "---" "------" "-------"
-                # iterate
+                printf "%-8s %-20s %s\n" "PID" "进程名" "完整路径"
+                printf "%-8s %-20s %s\n" "---" "------" "-------"
+                # iterate, deduplicate by Tgid (show main thread only)
+                seen_tgids=""
                 for pid in $pids; do
-                    comm="$(cat /proc/$pid/comm 2>/dev/null || echo '?')"
-                    exe="$(readlink /proc/$pid/exe 2>/dev/null || echo '?')"
-                    printf "%-8s %-16s %s\n" "$pid" "$comm" "$exe"
+                    tgid="$(awk '/^Tgid:/{print $2}' /proc/$pid/status 2>/dev/null)"
+                    [[ -z "$tgid" ]] && tgid="$pid"
+                    # skip if this tgid was already seen (sub-thread of same process)
+                    case " $seen_tgids " in
+                        *" $tgid "*) continue ;;
+                    esac
+                    seen_tgids="$seen_tgids $tgid"
+                    comm="$(cat /proc/$tgid/comm 2>/dev/null || echo '?')"
+                    exe="$(readlink /proc/$tgid/exe 2>/dev/null || echo '?')"
+                    printf "%-8s %-20s %s\n" "$tgid" "$comm" "$exe"
                 done
             fi
             echo "[agentgateway] ═══════════════════════════════════════════"
