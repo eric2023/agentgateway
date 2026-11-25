@@ -1611,7 +1611,7 @@ def main():
     log(f"  CA cert:  {CA_CERT_PATH}")
     log(f"  Audit:    {os.path.join(AUDIT_DIR, 'audit.jsonl')}")
     log(f"{'='*60}")
-    log(f"Primary interception: transparent_proxy.py :8444 (iptables REDIRECT)")
+    log(f"Primary interception: mitmdump :8444 (iptables REDIRECT, agw_addon.py)")
     log(f"This CONNECT proxy is a fallback for explicit proxy clients.")
     log(f"{'='*60}")
 

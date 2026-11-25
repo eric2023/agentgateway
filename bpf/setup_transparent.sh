@@ -24,7 +24,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # 1. system-wide CA trust
-install -m 644 certs/ca-cert.pem /etc/ssl/certs/agentgateway-ca.pem
+install -m 644 ~/.mitmproxy/mitmproxy-ca-cert.pem /etc/ssl/certs/agentgateway-ca.pem 2>/dev/null || install -m 644 certs/ca-cert.pem /etc/ssl/certs/agentgateway-ca.pem
 update-ca-certificates
 echo "[tproxy] CA installed system-wide"
 
@@ -37,5 +37,5 @@ echo "[tproxy] nftables:"
 nft list chain inet agentgateway output
 
 # 3. run transparent proxy
-echo "[tproxy] starting transparent proxy on 127.0.0.1:$GATEWAY_PORT ..."
-exec python3 gateway/transparent_proxy.py
+echo "[tproxy] starting mitmproxy on 127.0.0.1:$GATEWAY_PORT ..."
+exec mitmdump --mode transparent --listen-host 127.0.0.1 --listen-port "$GATEWAY_PORT" --set ssl_insecure=true -s gateway/agw_addon.py

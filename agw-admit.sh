@@ -68,7 +68,7 @@ if [[ -z "$SESSION_ID" ]]; then
     SESSION_ID="session-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
 fi
 
-# Set AgentGateway identity (read by transparent_proxy.py for audit attribution)
+# Set AgentGateway identity (read by agw_addon.py for audit attribution)
 export AGENTGATEWAY_APP_NAME="$APP_NAME"
 export AGENTGATEWAY_AGENT_ID="$AGENT_ID"
 export AGENTGATEWAY_SESSION_ID="$SESSION_ID"

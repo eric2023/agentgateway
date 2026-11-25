@@ -1,8 +1,8 @@
 #!/bin/bash
-# start.sh — Start AgentGateway transparent proxy + Dashboard in one shot.
+# start.sh — Start AgentGateway (mitmproxy transparent proxy) + Dashboard.
 #
 # Usage:
-#   ./start.sh start      # start transparent proxy + dashboard (background)
+#   ./start.sh start      # start mitmproxy + dashboard (background)
 #   ./start.sh -d         # same as start (daemon mode)
 #   ./start.sh fg         # start in foreground (Ctrl+C to stop both)
 #   ./start.sh stop       # stop both
@@ -13,16 +13,20 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TPROXY="$PROJECT_DIR/gateway/transparent_proxy.py"
+ADDON="$PROJECT_DIR/gateway/agw_addon.py"
 DASHBOARD="$PROJECT_DIR/dashboard/dashboard.py"
 LOG_DIR="$PROJECT_DIR/logs"
-TPROXY_LOG="$LOG_DIR/tproxy.log"
+PROXY_LOG="$LOG_DIR/proxy.log"
 DASHBOARD_LOG="$LOG_DIR/dashboard.log"
-TPROXY_PIDFILE="$LOG_DIR/tproxy.pid"
+PROXY_PIDFILE="$LOG_DIR/proxy.pid"
 DASHBOARD_PIDFILE="$LOG_DIR/dashboard.pid"
 
 PYTHON="$(command -v python3 || true)"
-[[ -z "$PYTHON" ]] && PYTHON="/home/ut000520@uos/.pyenv/shims/python3"
+if [[ -z "$PYTHON" ]]; then
+    PYTHON="/home/ut000520@uos/.pyenv/shims/python3"
+fi
+MITMDUMP="$(command -v mitmdump || true)"
+PROXY_PORT=8444
 
 mkdir -p "$LOG_DIR"
 
@@ -56,23 +60,34 @@ stop_proc() {
     rm -f "$pidfile"
 }
 
+# start_proc accepts a full command string (supports args).
 start_proc() {
-    local name="$1" script="$2" pidfile="$3" logfile="$4"
+    local name="$1" cmd="$2" pidfile="$3" logfile="$4"
     if is_running "$pidfile"; then
         echo "[start.sh] $name already running (pid=$(cat "$pidfile"))."
         return 0
     fi
     echo "[start.sh] Starting $name ..."
-    "$PYTHON" "$script" >>"$logfile" 2>&1 &
+    bash -c "$cmd" >>"$logfile" 2>&1 &
     local pid=$!
     echo "$pid" > "$pidfile"
     echo "[start.sh] $name started (pid=$pid, log=$logfile)."
 }
 
+# ─── proxy command ──────────────────────────────────────────────────────────
+
+proxy_cmd() {
+    if [[ -z "$MITMDUMP" ]]; then
+        echo "[start.sh] ERROR: mitmdump not found. Install with: pip3 install mitmproxy==5.3.0" >&2
+        exit 1
+    fi
+    echo "$MITMDUMP --mode transparent --listen-host 127.0.0.1 --listen-port $PROXY_PORT --set ssl_insecure=true -s $ADDON"
+}
+
 # ─── actions ────────────────────────────────────────────────────────────────
 
 do_stop() {
-    stop_proc "transparent-proxy" "$TPROXY_PIDFILE"
+    stop_proc "mitmproxy" "$PROXY_PIDFILE"
     stop_proc "dashboard" "$DASHBOARD_PIDFILE"
 }
 
@@ -88,15 +103,15 @@ do_start() {
         echo "[start.sh] WARNING: cgroup not ready. Run './start.sh setup' first."
     fi
 
-    start_proc "transparent-proxy" "$TPROXY"   "$TPROXY_PIDFILE"   "$TPROXY_LOG"
-    sleep 1.5   # let tproxy bind the port before dashboard
-    start_proc "dashboard"         "$DASHBOARD" "$DASHBOARD_PIDFILE" "$DASHBOARD_LOG"
+    start_proc "mitmproxy" "$(proxy_cmd)" "$PROXY_PIDFILE" "$PROXY_LOG"
+    sleep 1.5   # let mitmproxy bind the port before dashboard
+    start_proc "dashboard" "$PYTHON $DASHBOARD" "$DASHBOARD_PIDFILE" "$DASHBOARD_LOG"
 
     echo
     echo "[start.sh] ─────────────────────────────────────"
-    echo "[start.sh] Transparent proxy: 127.0.0.1:8444"
-    echo "[start.sh] Dashboard:         http://127.0.0.1:9090"
-    echo "[start.sh] Logs:  $TPROXY_LOG"
+    echo "[start.sh] mitmproxy (transparent): 127.0.0.1:$PROXY_PORT"
+    echo "[start.sh] Dashboard:               http://127.0.0.1:9090"
+    echo "[start.sh] Logs:  $PROXY_LOG"
     echo "[start.sh]        $DASHBOARD_LOG"
     echo "[start.sh] Stop:  $0 stop"
     echo "[start.sh] ─────────────────────────────────────"
@@ -106,11 +121,11 @@ do_foreground() {
     # Stop any background instances.
     do_stop 2>/dev/null || true
 
-    echo "[start.sh] Starting transparent proxy (foreground) ..."
-    "$PYTHON" "$TPROXY" >>"$TPROXY_LOG" 2>&1 &
-    TP_PID=$!
-    echo "$TP_PID" > "$TPROXY_PIDFILE"
-    echo "[start.sh] Transparent proxy pid=$TP_PID"
+    echo "[start.sh] Starting mitmproxy (foreground) ..."
+    bash -c "$(proxy_cmd)" >>"$PROXY_LOG" 2>&1 &
+    PROXY_PID=$!
+    echo "$PROXY_PID" > "$PROXY_PIDFILE"
+    echo "[start.sh] mitmproxy pid=$PROXY_PID"
 
     sleep 1.5
 
@@ -121,18 +136,18 @@ do_foreground() {
     echo "[start.sh] Dashboard pid=$DASH_PID"
 
     echo
-    echo "[start.sh] Transparent proxy: 127.0.0.1:8444"
-    echo "[start.sh] Dashboard:         http://127.0.0.1:9090"
+    echo "[start.sh] mitmproxy (transparent): 127.0.0.1:$PROXY_PORT"
+    echo "[start.sh] Dashboard:               http://127.0.0.1:9090"
     echo "[start.sh] Press Ctrl+C to stop both."
     echo
 
     cleanup() {
         echo
         echo "[start.sh] Stopping ..."
-        kill "$TP_PID" 2>/dev/null || true
+        kill "$PROXY_PID" 2>/dev/null || true
         kill "$DASH_PID" 2>/dev/null || true
-        rm -f "$TPROXY_PIDFILE" "$DASHBOARD_PIDFILE"
-        wait "$TP_PID" 2>/dev/null || true
+        rm -f "$PROXY_PIDFILE" "$DASHBOARD_PIDFILE"
+        wait "$PROXY_PID" 2>/dev/null || true
         wait "$DASH_PID" 2>/dev/null || true
         echo "[start.sh] Stopped."
     }
@@ -142,10 +157,10 @@ do_foreground() {
 }
 
 do_status() {
-    if is_running "$TPROXY_PIDFILE"; then
-        echo "[start.sh] Transparent proxy: running (pid=$(cat "$TPROXY_PIDFILE"))"
+    if is_running "$PROXY_PIDFILE"; then
+        echo "[start.sh] mitmproxy: running (pid=$(cat "$PROXY_PIDFILE"))"
     else
-        echo "[start.sh] Transparent proxy: stopped"
+        echo "[start.sh] mitmproxy: stopped"
     fi
     if is_running "$DASHBOARD_PIDFILE"; then
         echo "[start.sh] Dashboard: running (pid=$(cat "$DASHBOARD_PIDFILE"))"
@@ -172,7 +187,7 @@ case "${1:-start}" in
     *)
         echo "Usage: $0 {start|stop|restart|status|fg|setup}"
         echo
-        echo "  start    Start transparent proxy + dashboard (default)"
+        echo "  start    Start mitmproxy + dashboard (default)"
         echo "  -d       Same as start (daemon mode)"
         echo "  fg       Start in foreground (Ctrl+C to stop both)"
         echo "  stop     Stop both"

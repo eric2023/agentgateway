@@ -4,17 +4,19 @@
 
 AgentGateway 通过 iptables REDIRECT + cgroup net_cls 进程级隔离，零改造拦截 agw-admit 纳入的 Agent 进程的所有 HTTPS 请求，对 AI 请求进行**审计记录并转发**（不阻断），捕获请求/响应内容、token 用量、工具调用链，并通过 Web 仪表盘实时展示。
 
+代理层基于 [mitmproxy](https://mitmproxy.org/) 5.3.0，支持 HTTP/2、WebSocket、SSE 流式响应。
+
 ## 架构
 
 ```mermaid
 graph TB
     subgraph 内核态["内核态（iptables-legacy NAT）"]
-        NFT["iptables OUTPUT 链<br/>cgroup net_cls 0x100001 :443<br/>REDIRECT → :8444"]
+        NFT["iptables OUTPUT 链<br/>cgroup net_cls 0x100001 :443/:8443/:9443<br/>REDIRECT → :8444"]
         CG["cgroup v1 net_cls<br/>/sys/fs/cgroup/net_cls/agentgateway<br/>classid 0x100001"]
     end
 
     subgraph 用户态["用户态"]
-        TP["transparent_proxy.py :8444<br/>SNI 提取 → MITM 全部流量<br/>复用 agentgatewayd 的 CA/L7/审计/连接池"]
+        TP["mitmdump :8444 (transparent mode)<br/>agw_addon.py: AI 识别 + 审计 + 进程归因<br/>HTTP/2 · WebSocket · SSE 流式"]
         DASH["dashboard.py :9090<br/>Web 仪表盘"]
         SETUP["setup_iptables.sh<br/>一次性 root 设置<br/>modprobe + cgroup + iptables + CA"]
     end
@@ -25,7 +27,7 @@ graph TB
     end
 
     subgraph CA["系统级 CA 信任"]
-        SYS["/etc/ssl/certs/agentgateway-ca.pem<br/>update-ca-certificates"]
+        SYS["/etc/ssl/certs/agentgateway-ca.pem<br/>mitmproxy CA → update-ca-certificates"]
     end
 
     TE -->|"进程写入 cgroup"| CG
@@ -48,8 +50,8 @@ graph TB
 
 1. **agw-admit** 将 Agent 进程写入 cgroup `net_cls/agentgateway`（classid 0x100001）
 2. Agent 发起 HTTPS → iptables OUTPUT 链匹配 cgroup classid → REDIRECT 到 :8444
-3. transparent_proxy.py 收到连接 → `SO_ORIGINAL_DST` 获取原始目标 → MSG_PEEK 提取 SNI
-4. 对全部流量执行 MITM TLS（动态签发证书）→ 读取明文 HTTP → `detect_ai_request()` L7 识别
+3. mitmdump (transparent mode) 收到连接 → `SO_ORIGINAL_DST` 获取原始目标 → MITM TLS
+4. agw_addon.py 读取明文 HTTP → `detect_ai_request()` L7 识别
 5. AI 请求审计记录到 `audit/audit.jsonl` → 原样转发到真实目标
 6. 非 AI 请求直接转发（仍经 MITM TLS，但无审计）
 7. Dashboard 读取审计日志，在 `http://127.0.0.1:9090` 展示
@@ -61,16 +63,16 @@ graph TB
 - **按进程拦截**：只有 agw-admit 纳入 cgroup 的进程的 :443 流量被重定向，其他所有进程（浏览器、邮件、应用商店）零影响
 - **Agent 零改造**：不设任何环境变量，不需要修改代码，不需要特殊启动参数
 - **不可绕过**：iptables NAT 在内核态重定向，Agent 无法绕过
-- **零外部依赖**：网关和仪表盘仅使用 Python 标准库 + `cryptography`
+- **完整协议支持**：基于 mitmproxy，原生支持 HTTP/2、WebSocket、SSE 流式响应
 
 ## 目录结构
 
 ```
 agentgateway/
 ├── gateway/
-│   ├── agentgatewayd.py       # 网关共享模块（CA/L7/审计/连接池）
-│   ├── transparent_proxy.py   # 透明代理（iptables REDIRECT 目标）
-│   └── gen_ca.py              # CA 证书生成器
+│   ├── agentgatewayd.py       # 网关共享模块（CA/L7识别/审计/进程归因）
+│   ├── agw_addon.py           # mitmproxy addon（AI 识别 + 审计 + 进程归因）
+│   └── gen_ca.py              # CA 证书生成器（agentgatewayd.py 备用 CA）
 ├── dashboard/
 │   ├── dashboard.py           # Web 仪表盘
 │   └── dashboard_template.html
@@ -81,7 +83,7 @@ agentgateway/
 │   ├── 方案A_透明代理进程级拦截_4.19内核.md   # 当前方案 spec
 │   └── 方案B_BPF-LSM内核级管控_6.6内核.md     # V25 未来扩展 spec
 ├── bpf/                       # BPF-LSM/uprobe 代码（6.6+ 内核未来扩展）
-├── certs/                     # CA 证书 + 动态签发的主机证书
+├── certs/                     # agentgatewayd.py 备用 CA 证书
 ├── audit/
 │   └── audit.jsonl            # 审计日志（JSONL 格式）
 ├── logs/                      # 运行日志
@@ -92,27 +94,25 @@ agentgateway/
 
 | 依赖 | 版本 | 说明 | 必需 |
 |------|------|------|------|
-| Python | ≥ 3.8 | 透明代理 + 仪表盘 | ✅ |
-| cryptography | ≥ 2.6 | 证书生成 / TLS（`pip install cryptography`） | ✅ |
+| Python | ≥ 3.7 | 仪表盘 + agentgatewayd 共享模块 | ✅ |
+| mitmproxy | 5.3.0 | 透明代理（HTTP/2/WebSocket/SSE） | ✅ |
+| cryptography | ≥ 2.6 | agentgatewayd CA 加载 | ✅ |
 | iptables-legacy | 系统自带 | cgroup 匹配 + REDIRECT（4.19 默认安装） | ✅ |
 | xt_cgroup.ko | 内核模块 | iptables cgroup 匹配（4.19 默认提供） | ✅ |
 | root 权限 | 一次性 | modprobe + cgroup + iptables + CA 安装 | ✅ |
 | certutil (nss-tools) | 任意 | 导入 CA 到浏览器 NSS 库 | ⬜ 可选 |
 
-## 部署
-
-### 1. 生成 CA 证书（首次）
+### 安装 mitmproxy
 
 ```bash
-cd agentgateway
-python3 gateway/gen_ca.py
+pip3 install mitmproxy==5.3.0
 ```
 
-生成：
-- `certs/ca-cert.pem` — 根 CA 证书（CN=AgentGateway Root CA）
-- `certs/ca-key.pem` — 根 CA 私钥（权限 600）
+> mitmproxy 5.3.0 是 Python 3.7 + 4.19 内核环境下最高兼容版本。10.x+ 需要 Python 3.10+。
 
-### 2. 一次性 root 设置
+## 部署
+
+### 1. 一次性 root 设置
 
 ```bash
 cd agentgateway
@@ -124,9 +124,10 @@ cd agentgateway
 1. `modprobe xt_cgroup` — 加载 cgroup 匹配模块
 2. 创建 `/sys/fs/cgroup/net_cls/agentgateway` cgroup（classid 0x100001）
 3. `chmod 666 tasks` — 允许普通用户 agw-admit 写入
-4. 安装 CA 到 `/etc/ssl/certs/agentgateway-ca.pem` + `update-ca-certificates`
-5. 安装 CA 到 NSS DB（Chrome/Chromium 信任）
-6. 设置 iptables-legacy REDIRECT 规则
+4. 首次运行 `mitmdump` 生成 mitmproxy CA（`~/.mitmproxy/mitmproxy-ca-cert.pem`）
+5. 安装 mitmproxy CA 到 `/etc/ssl/certs/agentgateway-ca.pem` + `update-ca-certificates`
+6. 安装 CA 到 NSS DB（Chrome/Chromium 信任）
+7. 设置 iptables-legacy REDIRECT 规则（:443 :8443 :9443 → :8444）
 
 **验证**：
 ```bash
@@ -139,13 +140,13 @@ cd agentgateway
 sudo bash setup_iptables.sh --cleanup
 ```
 
-### 3. 安装 CA 到浏览器（可选）
+### 2. 安装 CA 到浏览器（可选）
 
 如果需要拦截浏览器（如 Chrome）中的 AI 请求，`setup_iptables.sh` 已自动将 CA 导入 NSS DB。如需手动操作：
 
 ```bash
 certutil -d sql:$HOME/.pki/nssdb -A -t "C,," \
-  -n "AgentGateway Root CA" -i certs/ca-cert.pem
+  -n "mitmproxy" -i ~/.mitmproxy/mitmproxy-ca-cert.pem
 ```
 
 > 导入后需重启浏览器才能生效。
@@ -161,7 +162,7 @@ cd agentgateway
 
 | 命令 | 说明 |
 |------|------|
-| `./start.sh start` | 启动透明代理 + 仪表盘（后台） |
+| `./start.sh start` | 启动 mitmproxy + 仪表盘（后台） |
 | `./start.sh fg` | 前台运行（Ctrl+C 停止） |
 | `./start.sh stop` | 停止两者 |
 | `./start.sh restart` | 重启两者 |
@@ -190,14 +191,14 @@ cd agentgateway
 
 agw-admit 将当前进程写入 cgroup `net_cls/agentgateway/tasks`，Agent 启动后其 :443 出向流量自动被 iptables 重定向到透明代理。Agent **零改造、零环境变量**。
 
-**Agent 身份归因**：agw-admit 设置 `AGENTGATEWAY_APP_NAME`、`AGENTGATEWAY_AGENT_ID`、`AGENTGATEWAY_SESSION_ID` 环境变量。透明代理通过 `/proc/net/tcp` + `/proc/*/fd` 找到发起连接的进程，读取其环境变量中的 Agent 身份信息，写入审计日志。即使 Agent 通过 curl/python3 等工具进程发送请求，代理也能沿父进程链追溯到真正的 Agent 进程（如 omp），并从工具进程的环境变量中获取 agw-admit 设置的身份信息。
+**Agent 身份归因**：agw-admit 设置 `AGENTGATEWAY_APP_NAME`、`AGENTGATEWAY_AGENT_ID`、`AGENTGATEWAY_SESSION_ID` 环境变量。agw_addon.py 通过 `/proc/net/tcp` + `/proc/*/fd` 找到发起连接的进程，读取其环境变量中的 Agent 身份信息，写入审计日志。即使 Agent 通过 curl/python3 等工具进程发送请求，代理也能沿父进程链追溯到真正的 Agent 进程（如 omp），并从工具进程的环境变量中获取 agw-admit 设置的身份信息。
 
 ### 验证拦截
 
 ```bash
 # 用 agw-admit 启动 curl 发送 AI 请求
 ./agw-admit.sh --app "TestApp" curl -sS \
-  --cacert certs/ca-cert.pem \
+  --cacert ~/.mitmproxy/mitmproxy-ca-cert.pem \
   -X POST https://ai.uniontech.com/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer test-key' \
@@ -236,7 +237,7 @@ tail -f audit/audit.jsonl | python3 -m json.tool
 
 ```jsonc
 {
-  "ts": "2026-11-24T03:30:00.000000+00:00",  // UTC 时间戳
+  "ts": "2026-11-25T03:30:00.000000+00:00",  // UTC 时间戳
   "event": "ai_request_audited",              // 事件类型
   "decision": "AUDIT",                        // 决策：AUDIT
   "agent_id": "agent-def456",                 // Agent ID（agw-admit 设置）
@@ -248,39 +249,40 @@ tail -f audit/audit.jsonl | python3 -m json.tool
   "model": "glm-5",                          // AI 模型
   "confidence": 6,                            // AI 识别置信度
   "request_body": {...},                      // 请求体（含 messages、tools 等）
-  "response_status": 200,                     // 响应状态码
-  "token_usage": {"total_tokens": 1234},      // token 用量
-  "latency_ms": 8658,                         // 延迟
-  "source": "transparent_proxy"               // 来源
+  "stream_mode": true,                        // 是否流式请求
+  "source": "mitmproxy_addon"                 // 来源
 }
 ```
 
 ## 配置参考
 
-### 透明代理配置（`gateway/transparent_proxy.py`）
+### mitmproxy 代理配置（`start.sh`）
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `HOST` | `127.0.0.1` | 监听地址 |
-| `PORT` | `8444` | iptables REDIRECT 目标端口 |
-| `SO_ORIGINAL_DST` | `80` | 获取 iptables REDIRECT 原始目标的 sockopt |
+| `--mode transparent` | — | 透明代理模式（使用 `SO_ORIGINAL_DST`） |
+| `--listen-host` | `127.0.0.1` | 监听地址 |
+| `--listen-port` | `8444` | iptables REDIRECT 目标端口 |
+| `--set ssl_insecure=true` | — | 不验证上游证书 |
+| `-s gateway/agw_addon.py` | — | 加载 AI 审计 addon |
 
 ### 网关共享模块配置（`gateway/agentgatewayd.py`）
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `GATEWAY_HOST` | `127.0.0.1` | CONNECT 代理监听地址（fallback） |
-| `GATEWAY_PORT` | `8443` | CONNECT 代理监听端口（fallback） |
 | `AI_API_PATHS` | `/v1/chat/completions` 等 | AI API 路径模式 |
-| `AI_BODY_SIGNALS` | `model`, `messages` 等 | 请求体 AI 信号 |
+| `AI_AUTH_HEADERS` | `authorization`, `x-api-key` 等 | AI 认证头 |
+| `AI_HOST_PATTERNS` | `openai.com`, `anthropic.com` 等 | 需要 MITM 的主机 |
 
 ### iptables 规则
 
 ```bash
-# 重定向 cgroup 0x100001 进程的 :443 到 :8444
-/usr/sbin/iptables-legacy -t nat -A OUTPUT \
-  -p tcp --dport 443 -m cgroup --cgroup 0x100001 \
-  -j REDIRECT --to-port 8444
+# 重定向 cgroup 0x100001 进程的 :443/:8443/:9443 到 :8444
+for port in 443 8443 9443; do
+  /usr/sbin/iptables-legacy -t nat -A OUTPUT \
+    -p tcp --dport $port -m cgroup --cgroup 0x100001 \
+    -j REDIRECT --to-port 8444
+done
 ```
 
 ### cgroup 配置
@@ -315,6 +317,7 @@ sudo bash setup_iptables.sh --cleanup
 | 无文件管控 | 无法限制文件读写 | 需 6.6+ BPF-LSM |
 | 无自保护 | Agent 可杀网关进程 | 需 6.6+ BPF-LSM security_bpf |
 | cert pinning 应用 | 不信任系统 CA | 需 6.6+ BPF uprobe 取明文 |
+| mitmproxy 5.3.0 | 2020 年版本 | 4.19 + Python 3.7 最高兼容版本 |
 
 ## 技术方案文档
 

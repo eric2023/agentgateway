@@ -50,24 +50,32 @@ echo "$CLASSID" > "$CGROUP_DIR/net_cls.classid"
 chmod 666 "$CGROUP_DIR/tasks"
 echo "[setup] cgroup tasks writable by all users"
 
-# ─── 4. Install system-level CA ────────────────────────────────────────────
-CA_SRC="$SCRIPT_DIR/certs/ca-cert.pem"
+# ─── 4. Install system-level CA (mitmproxy CA) ─────────────────────────────
+MITM_CA_DIR="$HOME/.mitmproxy"
+MITM_CA_SRC="$MITM_CA_DIR/mitmproxy-ca-cert.pem"
 CA_DST="/etc/ssl/certs/agentgateway-ca.pem"
-if [[ -f "$CA_SRC" ]]; then
-    echo "[setup] Installing CA to $CA_DST..."
-    cp "$CA_SRC" "$CA_DST"
+
+# Generate mitmproxy CA on first run
+if [[ ! -f "$MITM_CA_SRC" ]]; then
+    echo "[setup] Generating mitmproxy CA..."
+    timeout 3 mitmdump --quiet 2>/dev/null || true
+fi
+
+if [[ -f "$MITM_CA_SRC" ]]; then
+    echo "[setup] Installing mitmproxy CA to $CA_DST..."
+    cp "$MITM_CA_SRC" "$CA_DST"
     chmod 644 "$CA_DST"
     update-ca-certificates 2>/dev/null || true
     echo "[setup] System CA installed"
 else
-    echo "[setup] WARNING: $CA_SRC not found — run 'python3 gateway/gen_ca.py' first"
+    echo "[setup] WARNING: $MITM_CA_SRC not found — mitmproxy CA generation failed"
 fi
 
 # Also install to NSS DB for Chrome/Chromium
 if command -v certutil &>/dev/null; then
     NSSDB="$HOME/.pki/nssdb"
     mkdir -p "$NSSDB"
-    certutil -d "sql:$NSSDB" -A -t "C," -n "AgentGateway Root CA" -i "$CA_SRC" 2>/dev/null || true
+    certutil -d "sql:$NSSDB" -A -t "C," -n "mitmproxy" -i "$MITM_CA_SRC" 2>/dev/null || true
     echo "[setup] NSS DB CA installed"
 fi
 
