@@ -14,6 +14,7 @@
 #   - _resolve_agent_process(): parent-chain walk to find real agent
 #   - _proc_cache / _proc_scan_semaphore: process lookup caching/throttling
 
+import json
 import os
 import sys
 import time
@@ -93,6 +94,10 @@ class AgentGatewayAddon:
         audit_session = peer_session or self.session_id
 
         body_str = body.decode("utf-8", errors="replace")
+        try:
+            request_body = json.loads(body_str)
+        except (json.JSONDecodeError, ValueError):
+            request_body = None
         event = {
             "event": "ai_request_audited",
             "decision": "AUDIT",
@@ -110,7 +115,8 @@ class AgentGatewayAddon:
             "preview": detail.get("preview", ""),
             "prompt_len": detail.get("prompt_len", 0),
             "request_headers": _redact_headers(headers),
-            "request_body": body_str[:2000],
+            "request_body": request_body,
+            "request_body_raw": body_str[:2000],
             "stream_mode": "stream" in body_str.lower(),
             "source": "mitmproxy_addon",
             "summary": (
