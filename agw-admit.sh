@@ -33,9 +33,10 @@ while [[ $# -gt 0 ]]; do
             cat <<'EOF'
 AgentGateway agw-admit — 将进程纳入 cgroup 拦截的 Agent 包装器
 
-Usage: agw-admit.sh [--app <名称>] [--agent-id <uuid>] [--session-id <uuid>] <command> [args...]
+Usage: agw-admit.sh [选项] [--app <名称>] <command> [args...]
 
 选项:
+  --list             查看 cgroup 信息（名称、classid、已纳入的进程）
   --app <名称>       应用名称（用于审计归属，默认 "unknown"）
   --agent-id <uuid>  Agent ID（不指定则自动生成）
   --session-id <uuid> 会话 ID（不指定则自动生成）
@@ -43,6 +44,7 @@ Usage: agw-admit.sh [--app <名称>] [--agent-id <uuid>] [--session-id <uuid>] <
   --                 结束选项解析，后续参数作为命令执行
 
 示例:
+  agw-admit.sh --list
   agw-admit.sh --app "OMP" /home/ut000520@uos/.local/bin/omp
   agw-admit.sh --app "TestApp" curl -sS https://httpbin.org/get
   agw-admit.sh --app "MyAgent" python3 my_agent.py
@@ -52,6 +54,38 @@ Usage: agw-admit.sh [--app <名称>] [--agent-id <uuid>] [--session-id <uuid>] <
   出向流量被 iptables REDIRECT 到 mitmproxy :8444 透明代理。
   Agent 零改造，无需设置任何环境变量。
 EOF
+            exit 0
+            ;;
+        --list)
+            CGROUP_DIR="/sys/fs/cgroup/net_cls/agentgateway"
+            echo "[agentgateway] ═══════════════════════════════════════════"
+            echo "[agentgateway] Cgroup 信息"
+            echo "[agentgateway] ═══════════════════════════════════════════"
+            echo "[agentgateway] 路径:       $CGROUP_DIR"
+            if [[ ! -d "$CGROUP_DIR" ]]; then
+                echo "[agentgateway] 状态:       未创建（请先运行 ./start.sh setup）"
+                exit 0
+            fi
+            echo "[agentgateway] 名称:       agentgateway"
+            classid="$(cat "$CGROUP_DIR/net_cls.classid" 2>/dev/null || echo 'N/A')"
+            echo "[agentgateway] ClassID:    $classid"
+            echo "[agentgateway] tasks 权限: $(stat -c '%a' "$CGROUP_DIR/tasks" 2>/dev/null || echo 'N/A')"
+            echo ""
+            echo "[agentgateway] ── 已纳入的进程 ──"
+            pids="$(cat "$CGROUP_DIR/tasks" 2>/dev/null)"
+            if [[ -z "$pids" ]]; then
+                echo "[agentgateway]   （无）"
+            else
+                printf "%-8s %-16s %s\n" "PID" "进程名" "完整路径"
+                printf "%-8s %-16s %s\n" "---" "------" "-------"
+                # iterate
+                for pid in $pids; do
+                    comm="$(cat /proc/$pid/comm 2>/dev/null || echo '?')"
+                    exe="$(readlink /proc/$pid/exe 2>/dev/null || echo '?')"
+                    printf "%-8s %-16s %s\n" "$pid" "$comm" "$exe"
+                done
+            fi
+            echo "[agentgateway] ═══════════════════════════════════════════"
             exit 0
             ;;
         --app)
