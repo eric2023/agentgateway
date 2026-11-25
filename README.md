@@ -27,7 +27,7 @@ graph TB
     end
 
     subgraph CA["系统级 CA 信任"]
-        SYS["/etc/ssl/certs/agentgateway-ca.pem<br/>mitmproxy CA → update-ca-certificates"]
+        SYS["/usr/local/share/ca-certificates/agentgateway-ca.crt<br/>→ update-ca-certificates → ca-certificates.crt"]
     end
 
     TE -->|"进程写入 cgroup"| CG
@@ -70,9 +70,9 @@ graph TB
 ```
 agentgateway/
 ├── gateway/
-│   ├── agentgatewayd.py       # 网关共享模块（CA/L7识别/审计/进程归因）
+│   ├── agentgatewayd.py       # 网关共享模块（L7识别/审计/进程归因）
 │   ├── agw_addon.py           # mitmproxy addon（AI 识别 + 审计 + 进程归因）
-│   └── gen_ca.py              # CA 证书生成器（agentgatewayd.py 备用 CA）
+│   └── gen_ca.py              # 旧 CA 证书生成器（mitmproxy 模式不再使用）
 ├── dashboard/
 │   ├── dashboard.py           # Web 仪表盘
 │   └── dashboard_template.html
@@ -83,7 +83,7 @@ agentgateway/
 │   ├── 方案A_透明代理进程级拦截_4.19内核.md   # 当前方案 spec
 │   └── 方案B_BPF-LSM内核级管控_6.6内核.md     # V25 未来扩展 spec
 ├── bpf/                       # BPF-LSM/uprobe 代码（6.6+ 内核未来扩展）
-├── certs/                     # agentgatewayd.py 备用 CA 证书
+├── certs/                     # 旧 CA 证书（mitmproxy 模式不再使用）
 ├── audit/
 │   └── audit.jsonl            # 审计日志（JSONL 格式）
 ├── logs/                      # 运行日志
@@ -96,7 +96,7 @@ agentgateway/
 |------|------|------|------|
 | Python | ≥ 3.7 | 仪表盘 + agentgatewayd 共享模块 | ✅ |
 | mitmproxy | 5.3.0 | 透明代理（HTTP/2/WebSocket/SSE） | ✅ |
-| cryptography | ≥ 2.6 | agentgatewayd CA 加载 | ✅ |
+| cryptography | ≥ 2.6 | agentgatewayd 旧 CA 加载（mitmproxy 模式不使用） | ⬜ 可选 |
 | iptables-legacy | 系统自带 | cgroup 匹配 + REDIRECT（4.19 默认安装） | ✅ |
 | xt_cgroup.ko | 内核模块 | iptables cgroup 匹配（4.19 默认提供） | ✅ |
 | root 权限 | 一次性 | modprobe + cgroup + iptables + CA 安装 | ✅ |
@@ -125,8 +125,8 @@ cd agentgateway
 2. 创建 `/sys/fs/cgroup/net_cls/agentgateway` cgroup（classid 0x100001）
 3. `chmod 666 tasks` — 允许普通用户 agw-admit 写入
 4. 首次运行 `mitmdump` 生成 mitmproxy CA（`~/.mitmproxy/mitmproxy-ca-cert.pem`）
-5. 安装 mitmproxy CA 到 `/etc/ssl/certs/agentgateway-ca.pem` + `update-ca-certificates`
-6. 安装 CA 到 NSS DB（Chrome/Chromium 信任）
+5. 安装 mitmproxy CA 到 `/usr/local/share/ca-certificates/agentgateway-ca.crt` + `update-ca-certificates`（写入 `ca-certificates.crt` bundle）
+6. 安装 CA 到 NSS DB（Chrome/Chromium 信任，删除旧 `AgentGateway Root CA`）
 7. 设置 iptables-legacy REDIRECT 规则（:443 :8443 :9443 → :8444）
 
 **验证**：
@@ -140,16 +140,31 @@ cd agentgateway
 sudo bash setup_iptables.sh --cleanup
 ```
 
-### 2. 安装 CA 到浏览器（可选）
+### 2. 证书信任链
 
-如果需要拦截浏览器（如 Chrome）中的 AI 请求，`setup_iptables.sh` 已自动将 CA 导入 NSS DB。如需手动操作：
+mitmproxy 在首次启动时自动生成 CA（`~/.mitmproxy/mitmproxy-ca-cert.pem`）。`./start.sh setup` 将此 CA 安装到系统信任库：
+
+| 安装位置 | 用途 | 应用 |
+|----------|------|------|
+| `/usr/local/share/ca-certificates/agentgateway-ca.crt` → `update-ca-certificates` → `ca-certificates.crt` | OpenSSL / Qt / Python / curl / GnuTLS | uos-ai、omp、命令行工具 |
+| NSS DB `~/.pki/nssdb`（nickname `mitmproxy`） | Chrome / Chromium 浏览器 | 浏览器中的 AI 请求 |
+
+> ⚠️ `update-ca-certificates` 只扫描 `/usr/local/share/ca-certificates/*.crt`，不扫描 `/etc/ssl/certs/`。CA 必须放到前者目录才能进入 `ca-certificates.crt` bundle。
+> ⚠️ `sudo` 默认重置 `$HOME`，`./start.sh setup` 使用 `sudo --preserve-env=HOME` 确保 CA 路径指向用户 `~/.mitmproxy/`。
+
+如需手动安装：
 
 ```bash
+# 系统 CA 库
+sudo cp ~/.mitmproxy/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/agentgateway-ca.crt
+sudo update-ca-certificates
+
+# NSS DB（浏览器）
 certutil -d sql:$HOME/.pki/nssdb -A -t "C,," \
   -n "mitmproxy" -i ~/.mitmproxy/mitmproxy-ca-cert.pem
 ```
 
-> 导入后需重启浏览器才能生效。
+> 安装后需重启相关应用才能生效。
 
 ## 运行
 
