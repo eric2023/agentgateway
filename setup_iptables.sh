@@ -127,17 +127,32 @@ if [[ -f "$CA_SRC" ]]; then
     cp "$CA_SRC" "$CA_DST"
     chmod 644 "$CA_DST"
     update-ca-certificates 2>&1
-    # Verify CA actually entered the system bundle; if not, force rebuild
-    if ! grep -q "AgentGateway" /etc/ssl/certs/ca-certificates.crt 2>/dev/null; then
+    # Verify CA is in the system bundle by comparing fingerprint
+    # (grep for "AgentGateway" doesn't work — bundle is base64 DER)
+    CA_FP="$(openssl x509 -in "$CA_DST" -fingerprint -noout 2>/dev/null | cut -d= -f2)"
+    verify_ca_in_bundle() {
+        awk 'BEGIN{n=0} /BEGIN CERT/{n++; f="/tmp/_agw_v"n".pem"} {print > f}' \
+            /etc/ssl/certs/ca-certificates.crt 2>/dev/null
+        for f in /tmp/_agw_v*.pem; do
+            [[ -f "$f" ]] || continue
+            fp="$(openssl x509 -in "$f" -fingerprint -noout 2>/dev/null | cut -d= -f2)"
+            rm -f "$f"
+            [[ "$fp" == "$CA_FP" ]] && return 0
+        done
+        rm -f /tmp/_agw_v*.pem 2>/dev/null
+        return 1
+    }
+    if ! verify_ca_in_bundle; then
         echo "[setup] CA not in bundle after update, rebuilding with --fresh..." >&2
         update-ca-certificates --fresh 2>&1
     fi
-    if grep -q "AgentGateway" /etc/ssl/certs/ca-certificates.crt 2>/dev/null; then
+    if verify_ca_in_bundle; then
         echo "[setup] System CA installed and verified in ca-certificates.crt"
     else
-        echo "[setup] ERROR: CA not found in /etc/ssl/certs/ca-certificates.crt!" >&2
+        echo "[setup] ERROR: CA fingerprint not found in ca-certificates.crt!" >&2
         echo "[setup] Try manually: sudo update-ca-certificates --fresh" >&2
     fi
+    rm -f /tmp/_agw_v*.pem 2>/dev/null
 else
     echo "[setup] WARNING: $CA_SRC not found — CA generation failed" >&2
 fi
