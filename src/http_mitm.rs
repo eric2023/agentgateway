@@ -217,7 +217,12 @@ async fn read_http_request<R: AsyncReadExt + Unpin>(
             }
             break;
         }
-        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > 65536 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request header too large (>64KB)",
+            ));
+        }
         if let Some(pos) = find_header_end(&buf) {
             let header_str = String::from_utf8_lossy(&buf[..pos]);
             let header_end = pos + 4;
@@ -273,6 +278,9 @@ async fn stream_http_response(
             return Ok(false);
         }
         header_buf.extend_from_slice(&tmp[..n]);
+        if header_buf.len() > 65536 {
+            return Err("response header too large (>64KB)".into());
+        }
         if let Some(pos) = find_header_end(&header_buf) {
             let hdr_end = pos + 4;
             client.write_all(&header_buf[..hdr_end]).await?;
@@ -416,6 +424,9 @@ async fn stream_response_simple(
             return Ok(false);
         }
         header_buf.extend_from_slice(&tmp[..n]);
+        if header_buf.len() > 65536 {
+            return Err("response header too large (>64KB)".into());
+        }
         if let Some(pos) = find_header_end(&header_buf) {
             let hdr_end = pos + 4;
             client.write_all(&header_buf[..hdr_end]).await?;
@@ -484,13 +495,34 @@ async fn stream_response_simple(
 const CHUNK_TAIL_LEN: usize = 64 * 1024;
 
 /// Check if a chunked body buffer contains the "0\r\n\r\n" terminator.
-/// Matches either at the start of the body (single zero-size chunk) or
-/// after a chunk boundary ("\r\n0\r\n\r\n").
+/// Matches at body start or after "\r\n" (chunk boundary). To reduce false
+/// positives from chunk data, verifies the byte before "\r\n0" is not a hex
+/// digit (which would make "0" part of a larger chunk size like "a0\r\n").
 fn has_chunked_terminator(buf: &[u8]) -> bool {
+    // First chunk: body starts with "0\r\n\r\n"
     if buf.starts_with(b"0\r\n\r\n") {
         return true;
     }
-    buf.windows(7).any(|w| w == b"\r\n0\r\n\r\n")
+    // Subsequent chunks: look for "\r\n0\r\n\r\n" where the \r\n before 0
+    // is a chunk boundary (end of previous chunk's trailing \r\n).
+    // Verify the byte before \r\n is not a hex digit or ';' to avoid matching
+    // mid-chunk-size sequences like "...10\r\n\r\n" (chunk size 0x10, not 0).
+    let pat = b"\r\n0\r\n\r\n";
+    let mut start = 0;
+    while let Some(pos) = buf[start..].windows(pat.len()).position(|w| w == pat) {
+        let abs = start + pos;
+        // Check byte before the \r\n0\r\n\r\n match (if any)
+        if abs >= 1 {
+            let prev = buf[abs - 1];
+            if prev.is_ascii_hexdigit() || prev == b';' {
+                // "0" might be part of a larger chunk size — skip this match
+                start = abs + 1;
+                continue;
+            }
+        }
+        return true;
+    }
+    false
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -518,7 +550,9 @@ fn is_connection_close(header_str: &str) -> bool {
     header_str.lines().any(|line| {
         let l = line.to_lowercase();
         l.starts_with("connection:")
-            && l.splitn(2, ':').nth(1).map(|v| v.trim() == "close").unwrap_or(false)
+            && l.splitn(2, ':').nth(1)
+                .map(|v| v.split(',').any(|t| t.trim() == "close"))
+                .unwrap_or(false)
     })
 }
 
