@@ -217,6 +217,7 @@ async fn read_http_request<R: AsyncReadExt + Unpin>(
             }
             break;
         }
+        buf.extend_from_slice(&tmp[..n]);
         if buf.len() > 65536 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
