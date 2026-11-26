@@ -181,16 +181,17 @@ pub async fn process_http(
         upstream.flush().await?;
 
         // Stream response (replaces read_http_response + client.write_all)
-        if let Some((req_id, t0)) = &request_id {
-            stream_http_response(&mut upstream, client, req_id, *t0).await?;
+        // Returns true if the response signaled Connection: close.
+        let resp_close = if let Some((req_id, t0)) = &request_id {
+            stream_http_response(&mut upstream, client, req_id, *t0).await?
         } else {
-            stream_response_simple(&mut upstream, client).await?;
-        }
-        // Honor Connection: close on the request: break the keep-alive loop so
-        // the connection closes cleanly instead of waiting for a next request
-        // that will never come. Uses the request header string (req_data[..header_len]).
+            stream_response_simple(&mut upstream, client).await?
+        };
+        // Honor Connection: close on either the request or the response:
+        // break the keep-alive loop so the connection closes cleanly instead
+        // of waiting for a next request that will never come.
         let req_header_str = String::from_utf8_lossy(&req_data[..header_len]);
-        if is_connection_close(&req_header_str) {
+        if resp_close || is_connection_close(&req_header_str) {
             return Ok(());
         }
 
@@ -254,7 +255,7 @@ async fn stream_http_response(
     client: &mut TlsStream<TcpStream>,
     req_id: &str,
     t0: Instant,
-) -> Result<(), BoxError> {
+) -> Result<bool, BoxError> {
     // 1. Read response headers (up to \r\n\r\n), with 60s timeout
     let mut header_buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 4096];
@@ -269,7 +270,7 @@ async fn stream_http_response(
                 client.write_all(&header_buf).await?;
                 client.flush().await?;
             }
-            return Ok(());
+            return Ok(false);
         }
         header_buf.extend_from_slice(&tmp[..n]);
         if let Some(pos) = find_header_end(&header_buf) {
@@ -344,7 +345,7 @@ async fn stream_http_response(
     // 4. Record audit event
     let latency_ms = t0.elapsed().as_millis() as i64;
     let resp_body_json: Option<serde_json::Value> =
-        if body_preview.len() <= 4096 {
+        if body_preview.len() < 4096 {
             serde_json::from_slice(&body_preview).ok()
         } else {
             None
@@ -382,7 +383,8 @@ async fn stream_http_response(
     };
     audit_log(&event);
 
-    Ok(())
+    let resp_close = is_connection_close(&header_str);
+    Ok(resp_close)
 }
 
 /// Stream response for non-AI requests: parse headers, then stream the body
@@ -391,7 +393,7 @@ async fn stream_http_response(
 async fn stream_response_simple(
     upstream: &mut tokio_rustls::client::TlsStream<TcpStream>,
     client: &mut TlsStream<TcpStream>,
-) -> Result<(), BoxError> {
+) -> Result<bool, BoxError> {
     // 1. Read response headers (up to \r\n\r\n), with 60s timeout
     let mut header_buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 4096];
@@ -406,7 +408,7 @@ async fn stream_response_simple(
                 client.write_all(&header_buf).await?;
                 client.flush().await?;
             }
-            return Ok(());
+            return Ok(false);
         }
         header_buf.extend_from_slice(&tmp[..n]);
         if let Some(pos) = find_header_end(&header_buf) {
@@ -464,7 +466,8 @@ async fn stream_response_simple(
         total_body += n as u64;
     }
 
-    Ok(())
+    let resp_close = is_connection_close(&header_str);
+    Ok(resp_close)
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
