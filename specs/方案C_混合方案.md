@@ -4,6 +4,7 @@
 > 创建时间：2026-11-26
 > 前身：方案 A（Python mitmproxy 5.3.0）——因内存泄漏（dashboard 22GB + mitmdump 30GB = 52.9GB）导致系统卡死而重设
 > 替代：`specs/方案A_透明代理进程级拦截_4.19内核.md`（保留作历史参考）
+> **实现状态（2026-11-26）**：阶段 0-4 已完成（commit `40ef08c`），但有 P0 缺陷未修复。详见 `specs/方案C_缺陷审查.md`。
 
 ---
 
@@ -96,14 +97,16 @@ graph TB
 |---|---|
 | 语言 | Rust 1.84+ |
 | 运行时 | tokio（async，固定线程池 = CPU 核数） |
-| HTTP | hyper 1.x（HTTP/1.1 + HTTP/2） |
+| HTTP | 手动 HTTP/1.1 字节解析（非 hyper，见缺陷 C13） |
 | TLS | rustls 0.23 + rcgen 0.13（动态证书生成） |
-| WebSocket | tokio-tungstenite 0.24 |
-| SQLite | rusqlite 0.32（WAL 模式） |
+| WebSocket | 未实现 |
+| SQLite | rusqlite 0.32（WAL 模式，全局 Mutex，见缺陷 C04） |
 | 监听 | 127.0.0.1:8444（iptables REDIRECT 目标端口） |
 | 模式 | transparent（`SO_ORIGINAL_DST` 获取原始目标） |
-| 内存 | < 50MB（1000 并发 SSE 长连接） |
-| 线程 | 16（CPU 核数，非每连接一线程） |
+| 内存 | release build ~8.4MB binary，运行时 RSS ~50MB |
+| 线程 | tokio 线程池（CPU 核数） |
+
+> ⚠️ **实现偏差**：spec 原设计使用 hyper 解析 HTTP、tokio-tungstenite 支持 WebSocket，实际改用手动字节解析。SNI 提取未实现——当前用 IP 而非域名生成证书（缺陷 C01），是阻断端到端可用的核心缺陷。详见 `specs/方案C_缺陷审查.md`。
 
 **与方案 A 对比**：
 
@@ -250,17 +253,23 @@ def get_stats():
 ### 3.5 CA 管理
 
 Rust 代理启动时：
-1. 检查 `~/.agentgateway/ca.pem`（CA 私钥）和 `~/.agentgateway/ca-cert.pem`（CA 公钥证书）
+1. 检查 `certs/ca-cert.pem`（CA 证书）和 `certs/ca-key.pem`（CA 私钥，PKCS#8 格式）
 2. 不存在则用 `rcgen` 生成自签名 CA
-3. 运行时对每个 TLS 连接的 SNI hostname 动态生成叶子证书，用 CA 签名
-4. 叶子证书缓存在 `DashMap`（LRU，最多 1000 个 hostname）
+3. 运行时对每个 TLS 连接动态生成叶子证书，用 CA 签名
+4. 叶子证书缓存在 `HashMap`（⚠️ 当前无 LRU 上限，见缺陷 C07）
+
+> ⚠️ **实现偏差**：spec 原设计用 SNI hostname 生成证书，实际用 `orig_dst.ip().to_string()` 作 hostname（缺陷 C01）。正确做法应从 TLS ClientHello 提取 SNI。
+
+> ⚠️ **PKCS#8 限制**：rcgen ring 后端仅支持 PKCS#8 格式密钥。如果 CA 私钥是 PKCS#1（`-----BEGIN RSA PRIVATE KEY-----`），需用 `openssl pkcs8 -topk8 -nocrypt` 转换。
 
 **安装到系统 CA**（`setup_iptables.sh`）：
 ```bash
-cp ~/.agentgateway/ca-cert.pem \
+cp certs/ca-cert.pem \
    /usr/local/share/ca-certificates/agentgateway-ca.crt
 update-ca-certificates
 ```
+
+> ⚠️ **缺陷 C06**：`setup_iptables.sh` 当前仍引用 `~/.mitmproxy/mitmproxy-ca-cert.pem` 和 `timeout 3 mitmdump`，需改为 `certs/ca-cert.pem`。
 
 ### 3.6 进程归因（Rust 重写）
 
@@ -278,7 +287,10 @@ update-ca-certificates
 
 ### 3.8 setup_iptables.sh（微调）
 
-- CA 生成改为运行 Rust 二进制（`agentgateway --gen-ca`）而非 `timeout 3 mitmdump`
+> ⚠️ **缺陷 C06**：当前 `setup_iptables.sh` 仍使用 `timeout 3 mitmdump` 生成 CA + 安装 `~/.mitmproxy/mitmproxy-ca-cert.pem`，需改为安装 `certs/ca-cert.pem`。NSS DB nickname 也需从 `"mitmproxy"` 改为 `"agentgateway"`。
+
+- CA 安装改为 `certs/ca-cert.pem`（而非 `~/.mitmproxy/mitmproxy-ca-cert.pem`）
+- CA 生成由 Rust 代理自动完成（首次启动时 `certs/ca-cert.pem` 不存在则 rcgen 生成）
 - 其余不变（modprobe + cgroup + iptables + CA 安装）
 
 ### 3.9 start.sh（简化）
@@ -350,6 +362,11 @@ agentgateway/
 | 无文件管控 | 无法限制文件读写 | 需 6.6+ BPF-LSM |
 | 无自保护 | Agent 可杀网关进程 | 需 6.6+ BPF-LSM |
 | SQLite 单文件 | 并发写入受限于单写者 | WAL 模式 + 写入频率低（每请求 1 次） |
+| SNI 未提取（C01） | TLS 证书 CN/SAN 为 IP 而非域名 | 从 ClientHello 提取 SNI |
+| 仅 HTTP/1.1（C02/C08） | 不支持 HTTP/2 上游、chunked 请求体有 bug | 补全 chunked 解析 + HTTP/2 |
+| 非 AI 请求也被 MITM（C03） | 性能开销 + 兼容性风险 | 接线 should_mitm_host() |
+| 旧 Python 代码未删除（C05） | 混淆 + setup 脚本引用 mitmproxy | 删除 gateway/*.py |
+| 无超时（C11） | 上游不可达时任务永久阻塞 | 添加 TCP/TLS/HTTP 超时 |
 
 ---
 

@@ -4,7 +4,9 @@
 > 目标：Rust 替代 mitmproxy 代理核心 + SQLite 替代 JSONL + 修复 Python dashboard
 > 预计总工期：3 天
 
----
+> **执行状态（2026-11-26）**：阶段 0-4 全部完成，commit `22db442`（阶段0）+ `40ef08c`（阶段1-4）。
+> 已知缺陷见 `specs/方案C_缺陷审查.md`（P0×3 + P1×9 + P2×8）。
+> 关键遗留：C01（SNI 缺失导致 TLS 证书不匹配）、C06（setup 脚本仍用 mitmproxy CA）、C05（旧 Python 代码未删除）。
 
 ## 阶段 0：紧急修复 Python dashboard（让系统立即可用）
 
@@ -325,10 +327,10 @@ git push origin main
 
 ## 里程碑
 
-| 里程碑 | 完成标志 | 预计时间 |
+| 里程碑 | 完成标志 | 实际状态 |
 |--------|----------|----------|
-| M0：系统恢复可用 | Python dashboard 内存 < 50MB | 阶段 0 完成 |
-| M1：Rust 能转发流量 | Rust 二进制替代 mitmproxy，HTTPS 正常 | 阶段 1 完成 |
-| M2：完整审计能力 | SQLite 中有 AI 请求 + 响应 + 进程归因 | 阶段 2 完成 |
-| M3：全量替换 | 旧 Python 代理代码删除，dashboard 用 SQLite | 阶段 3 完成 |
-| M4：交付 | 集成测试通过，Spec 更新，Git push | 阶段 4 完成 |
+| M0：系统恢复可用 | Python dashboard 内存 < 50MB | ✅ `22db442` 22GB → 20MB |
+| M1：Rust 能转发流量 | Rust 二进制替代 mitmproxy，HTTPS 正常 | ⚠️ `40ef08c` 启动成功，但 C01 SNI 缺陷导致实际 TLS MITM 失败 |
+| M2：完整审计能力 | SQLite 中有 AI 请求 + 响应 + 进程归因 | ✅ `40ef08c` 4 个单元测试通过 |
+| M3：全量替换 | 旧 Python 代理代码删除，dashboard 用 SQLite | ⚠️ `40ef08c` start.sh + dashboard 已改，但旧 Python 代码未删（C05） |
+| M4：交付 | 集成测试通过，Spec 更新，Git push | ⚠️ `40ef08c` 已 push，但端到端未验证（C01 阻断） |
