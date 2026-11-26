@@ -41,7 +41,28 @@ def _redact_headers(headers):
         else:
             out[k] = v
     return out
-
+def _find_socket_inode(peer_port, exclude_port):
+    """Find socket inode by local port, scanning both /proc/net/tcp and tcp6."""
+    for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(proc_file) as f:
+                f.readline()  # skip header
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 10:
+                        continue
+                    if parts[3] != "01":  # ESTABLISHED
+                        continue
+                    l_port = int(parts[1].split(":")[1], 16)
+                    if l_port != peer_port:
+                        continue
+                    r_port = int(parts[2].split(":")[1], 16)
+                    if r_port == exclude_port:
+                        continue
+                    return parts[9]
+        except OSError:
+            continue
+    return None
 
 class AgentGatewayAddon:
     """mitmproxy addon: audit AI requests with process attribution."""
@@ -116,7 +137,6 @@ class AgentGatewayAddon:
             "prompt_len": detail.get("prompt_len", 0),
             "request_headers": _redact_headers(headers),
             "request_body": request_body,
-            "request_body_raw": body_str[:2000],
             "stream_mode": "stream" in body_str.lower(),
             "source": "mitmproxy_addon",
             "summary": (
@@ -126,11 +146,58 @@ class AgentGatewayAddon:
         }
         gw.audit_log(event)
 
+        # Store for response() hook to correlate request ↔ response
+        flow.metadata["agw_request_id"] = request_id
+        flow.metadata["agw_request_ts"] = t0
+
     def response(self, flow: http.HTTPFlow):
-        """Optionally record response metadata (status, token usage)."""
-        # Currently a no-op; audit happens at request time.
-        # Could extract token_usage from response body here if needed.
-        pass
+        """Record response metadata: status, headers, body, token usage, latency."""
+        request_id = flow.metadata.get("agw_request_id")
+        if not request_id:
+            return  # not an AI request (request() hook didn't fire)
+
+        response = flow.response
+        if not response:
+            return
+
+        t0 = flow.metadata.get("agw_request_ts")
+        latency_ms = int((time.time() - t0) * 1000) if t0 else None
+
+        resp_body = response.get_content() or b""
+        resp_str = resp_body.decode("utf-8", errors="replace")
+        try:
+            resp_json = json.loads(resp_str)
+        except (json.JSONDecodeError, ValueError):
+            resp_json = None
+
+        # Extract token usage from response body
+        token_usage = {}
+        if resp_json and isinstance(resp_json, dict):
+            usage = resp_json.get("usage", {})
+            if usage:
+                token_usage = {
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                }
+
+        event = {
+            "event": "ai_response",
+            "request_id": request_id,
+            "response_status": response.status_code,
+            "response_headers": _redact_headers(dict(response.headers)),
+            "response_body": resp_json,
+            "response_body_raw": resp_str[:4000],
+            "token_usage": token_usage,
+            "latency_ms": latency_ms,
+            "source": "mitmproxy_addon",
+            "summary": (
+                f"Response {response.status_code} ({latency_ms}ms)"
+                if latency_ms
+                else f"Response {response.status_code}"
+            ),
+        }
+        gw.audit_log(event)
 
     # ── process attribution ────────────────────────────────────────────
 
@@ -150,32 +217,12 @@ class AgentGatewayAddon:
         now = time.time()
         with gw._proc_cache_lock:
             cached = gw._proc_cache.get(peer_port)
-            if cached and (now - cached[3]) < gw._proc_cache_ttl:
-                return cached[0], cached[1], cached[2], None, None
+            if cached and (now - cached[5]) < gw._proc_cache_ttl:
+                return cached[0], cached[1], cached[2], cached[3], cached[4]
 
-        # Match client-side socket in /proc/net/tcp by local port.
-        # Exclude the proxy's own listening port to avoid false matches.
-        client_inode = None
-        try:
-            with open("/proc/net/tcp") as f:
-                f.readline()
-                for line in f:
-                    parts = line.split()
-                    if len(parts) < 10:
-                        continue
-                    if parts[3] != "01":  # ESTABLISHED
-                        continue
-                    l_port = int(parts[1].split(":")[1], 16)
-                    if l_port != peer_port:
-                        continue
-                    r_port = int(parts[2].split(":")[1], 16)
-                    if r_port == LISTEN_PORT:
-                        continue
-                    client_inode = parts[9]
-                    break
-        except OSError:
-            return None, None, None, None, None
-
+        # Match client-side socket in /proc/net/tcp and /proc/net/tcp6 by
+        # local port.  Exclude the proxy's own listening port.
+        client_inode = _find_socket_inode(peer_port, LISTEN_PORT)
         if not client_inode:
             return None, None, None, None, None
 
@@ -233,9 +280,15 @@ class AgentGatewayAddon:
             except (OSError, PermissionError):
                 app_name = agent_comm
 
+        # Generate stable agent_id/session_id from app_name if env not set
+        stable_name = app_name or agent_comm or "unknown"
+        if not agent_id:
+            agent_id = f"agent-{stable_name}"
+        if not session_id:
+            session_id = f"session-{stable_name}"
         with gw._proc_cache_lock:
             gw._proc_cache[peer_port] = (
-                agent_pid, agent_comm, app_name, now,
+                agent_pid, agent_comm, app_name, agent_id, session_id, now,
             )
 
         return agent_pid, agent_comm, app_name, agent_id, session_id

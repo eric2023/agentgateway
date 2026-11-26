@@ -96,7 +96,7 @@ do_start() {
     do_stop 2>/dev/null || true
 
     # Health checks: verify iptables rule and CA are installed
-    if [[ ! -f /etc/ssl/certs/agentgateway-ca.pem ]]; then
+    if [[ ! -f /usr/local/share/ca-certificates/agentgateway-ca.crt ]]; then
         echo "[start.sh] WARNING: System CA not installed. Run './start.sh setup' first."
     fi
     if [[ ! -w /sys/fs/cgroup/net_cls/agentgateway/tasks ]]; then

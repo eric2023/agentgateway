@@ -97,14 +97,17 @@ EOF
             exit 0
             ;;
         --app)
+            [[ -z "${2:-}" ]] && { echo "[agw-admit] Error: --app requires a value" >&2; exit 1; }
             APP_NAME="$2"
             shift 2
             ;;
         --agent-id)
+            [[ -z "${2:-}" ]] && { echo "[agw-admit] Error: --agent-id requires a value" >&2; exit 1; }
             AGENT_ID="$2"
             shift 2
             ;;
         --session-id)
+            [[ -z "${2:-}" ]] && { echo "[agw-admit] Error: --session-id requires a value" >&2; exit 1; }
             SESSION_ID="$2"
             shift 2
             ;;

@@ -11,7 +11,7 @@
 AgentGateway Dashboard — Zero-dependency web UI for AI request monitoring.
 
 Built with Python stdlib http.server + Chart.js (CDN).
-Reads audit events from audit/audit.jsonl and displays:
+Reads audit events from audit/audit.db (SQLite WAL) and displays:
 - Real-time stats (blocked/forwarded/audited/total)
 - Event timeline chart
 - Model distribution chart
@@ -26,13 +26,14 @@ Open: http://127.0.0.1:9090
 import os
 import json
 import time
+import sqlite3
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-AUDIT_LOG = os.path.join(BASE_DIR, "audit", "audit.jsonl")
+AUDIT_DB = os.path.join(BASE_DIR, "audit", "audit.db")
 DASHBOARD_HOST = "127.0.0.1"
 DASHBOARD_PORT = 9090
 
@@ -40,21 +41,40 @@ DASHBOARD_PORT = 9090
 LOCAL_TZ = timezone(timedelta(hours=8))
 
 
-def read_audit_events():
-    """Read all audit events from the JSONL log."""
-    events = []
-    if not os.path.exists(AUDIT_LOG):
-        return events
-    with open(AUDIT_LOG, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                events.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return events
+def get_db():
+    """Get a SQLite connection (WAL mode, read-only queries)."""
+    conn = sqlite3.connect(AUDIT_DB, timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def _parse_json(val):
+    """Safely parse a JSON string stored in SQLite, return dict/list or None."""
+    if not val:
+        return None
+    if isinstance(val, (dict, list)):
+        return val
+    try:
+        return json.loads(val)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _row_to_event(row):
+    """Convert a SQLite Row to an event dict (compatible with old JSONL format)."""
+    if row is None:
+        return {}
+    d = dict(row)
+    # Parse JSON fields stored as TEXT
+    d["signals"] = _parse_json(d.get("signals")) or []
+    d["request_headers"] = _parse_json(d.get("request_headers")) or {}
+    d["request_body"] = _parse_json(d.get("request_body"))
+    d["response_headers"] = _parse_json(d.get("response_headers")) or {}
+    d["response_body"] = _parse_json(d.get("response_body"))
+    d["token_usage"] = _parse_json(d.get("token_usage")) or {}
+    d["stream_mode"] = bool(d.get("stream_mode", 0))
+    return d
 
 
 def to_local_time_str(ts_str):
@@ -81,55 +101,62 @@ def to_local_time_short(ts_str):
         return ts_str[11:19] if len(ts_str) >= 19 else ts_str
 
 
-def get_stats(events):
-    """Compute aggregate stats from events."""
-    total = len(events)
-    blocked = [e for e in events if e.get("decision") == "BLOCK"]
-    forwarded = [e for e in events if e.get("decision") == "FORWARD"]
-    audited = [e for e in events if e.get("decision") == "AUDIT"]
+def get_stats():
+    """Compute aggregate stats from SQLite — O(1) queries, not O(n) scan."""
+    db = get_db()
+    try:
+        total = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        blocked = db.execute("SELECT COUNT(*) FROM events WHERE decision='BLOCK'").fetchone()[0]
+        forwarded = db.execute("SELECT COUNT(*) FROM events WHERE decision='FORWARD'").fetchone()[0]
+        audited = db.execute("SELECT COUNT(*) FROM events WHERE decision='AUDIT'").fetchone()[0]
 
-    host_counter = Counter()
-    for e in blocked + forwarded + audited:
-        host = e.get("host", "unknown")
-        decision = e.get("decision", "?")
-        host_counter[(host, decision)] += 1
+        # Host distribution (top 20)
+        host_rows = db.execute("""
+            SELECT host, decision, COUNT(*) as cnt
+            FROM events WHERE decision IN ('BLOCK','FORWARD','AUDIT')
+            GROUP BY host, decision ORDER BY cnt DESC LIMIT 20
+        """).fetchall()
+        hosts = [{"host": r["host"], "decision": r["decision"], "count": r["cnt"]}
+                 for r in host_rows]
 
-    model_counter = Counter()
-    for e in blocked + audited:
-        model = e.get("model", "unknown")
-        if model:
-            model_counter[model] += 1
+        # Model distribution (top 20)
+        model_rows = db.execute("""
+            SELECT model, COUNT(*) as cnt
+            FROM events WHERE decision IN ('BLOCK','AUDIT') AND model IS NOT NULL AND model != ''
+            GROUP BY model ORDER BY cnt DESC LIMIT 20
+        """).fetchall()
+        models = [{"model": r["model"], "count": r["cnt"]} for r in model_rows]
 
-    timeline = defaultdict(lambda: {"blocked": 0, "forwarded": 0, "audited": 0})
-    for e in blocked + forwarded + audited:
-        ts = e.get("ts_unix", 0)
-        if ts:
-            minute = datetime.fromtimestamp(ts, tz=LOCAL_TZ).strftime("%H:%M")
-            decision = e.get("decision", "").lower()
-            if decision == "block":
-                timeline[minute]["blocked"] += 1
-            elif decision == "forward":
-                timeline[minute]["forwarded"] += 1
-            elif decision == "audit":
-                timeline[minute]["audited"] += 1
-    return {
-        "total": total,
-        "blocked_count": len(blocked),
-        "forwarded_count": len(forwarded),
-        "audited_count": len(audited),
-        "hosts": [
-            {"host": h, "decision": d, "count": c}
-            for (h, d), c in host_counter.most_common(20)
-        ],
-        "models": [
-            {"model": m, "count": c}
-            for m, c in model_counter.most_common(20)
-        ],
-        "timeline": [
-            {"minute": k, "blocked": v["blocked"], "forwarded": v["forwarded"], "audited": v["audited"]}
-            for k, v in sorted(timeline.items())
-        ],
-    }
+        # Timeline (by minute, last 24h)
+        cutoff = time.time() - 86400
+        tl_rows = db.execute("""
+            SELECT ts_unix, decision FROM events
+            WHERE ts_unix > ? AND decision IN ('BLOCK','FORWARD','AUDIT')
+        """, (cutoff,)).fetchall()
+        timeline = defaultdict(lambda: {"blocked": 0, "forwarded": 0, "audited": 0})
+        for r in tl_rows:
+            ts = r["ts_unix"]
+            if ts:
+                minute = datetime.fromtimestamp(ts, tz=LOCAL_TZ).strftime("%H:%M")
+                decision = (r["decision"] or "").lower()
+                if decision in ("block", "forward", "audit"):
+                    timeline[minute][decision] += 1
+        tl_sorted = [{"minute": k, "blocked": v["blocked"],
+                      "forwarded": v["forwarded"], "audited": v["audited"]}
+                     for k, v in sorted(timeline.items())]
+
+        return {
+            "total": total,
+            "blocked_count": blocked,
+            "forwarded_count": forwarded,
+            "audited_count": audited,
+            "hosts": hosts,
+            "models": models,
+            "timeline": tl_sorted,
+        }
+    finally:
+        db.close()
+
 
 def extract_tool_calls(req_body, resp_body):
     """Extract tool call info from request/response bodies.
@@ -207,57 +234,66 @@ def extract_tool_calls(req_body, resp_body):
 
     has_skill = any(tc["tool_name"] == "skill" for tc in tool_calls)
     return tools_defined, tool_calls, has_skill
-def get_ai_requests(events):
-    """Get AI request events (request + matching response) for the Requests table."""
-    # Build request-response pairs by request_id
-    requests_by_id = {}
-    responses_by_id = {}
-    for e in events:
-        rid = e.get("request_id")
-        if not rid:
-            continue
-        ev = e.get("event", "")
-        if ev == "ai_request_audited":
-            requests_by_id[rid] = e
-        elif ev == "ai_response":
-            responses_by_id[rid] = e
 
-    # Merge into list
-    result = []
-    for rid, req in requests_by_id.items():
-        resp = responses_by_id.get(rid, {})
-        result.append({
-            "request_id": rid,
-            "ts": req.get("ts", ""),
-            "method": req.get("method", "?"),
-            "host": req.get("host", "?"),
-            "path": req.get("path", "?"),
-            "model": req.get("model", "?") or "?",
-            "confidence": req.get("confidence", 0),
-            "signals": req.get("signals", []),
-            "preview": req.get("preview", ""),
-            "stream_mode": req.get("stream_mode", False),
-            "session_id": req.get("session_id", ""),
-            "agent_id": req.get("agent_id", ""),
-            "app_name": req.get("app_name", "unknown"),
-            "request_body": req.get("request_body"),
-            "request_body_raw": req.get("request_body_raw", ""),
-            "response_status": resp.get("response_status"),
-            "response_headers": resp.get("response_headers", {}),
-            "response_body": resp.get("response_body"),
-            "response_body_raw": resp.get("response_body_raw", ""),
-            "token_usage": resp.get("token_usage", {}),
-            "latency_ms": resp.get("latency_ms"),
-            "has_response": bool(resp),
-            "error": resp.get("error") if resp else None,
-        })
-        # Extract tool call info
-        result[-1]["tools_defined"], result[-1]["tool_calls"], result[-1]["has_skill"] = \
-            extract_tool_calls(req.get("request_body"), resp.get("response_body"))
 
-    # Sort by timestamp descending
-    result.sort(key=lambda x: x.get("ts", ""), reverse=True)
-    return result
+def get_ai_requests(limit=200):
+    """Get AI request events with matching responses — SQL JOIN, not O(n) scan."""
+    db = get_db()
+    try:
+        rows = db.execute("""
+            SELECT r.*, resp.response_status, resp.response_headers,
+                   resp.response_body, resp.token_usage, resp.latency_ms
+            FROM events r
+            LEFT JOIN events resp ON r.request_id = resp.request_id
+                AND resp.event = 'ai_response'
+            WHERE r.event = 'ai_request_audited'
+            ORDER BY r.ts_unix DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+        result = []
+        for row in rows:
+            req = _row_to_event(row)
+            # Response fields come from the JOIN alias — extract from row directly
+            resp_body = _parse_json(row["response_body"]) if row["response_body"] else None
+            resp_headers = _parse_json(row["response_headers"]) if row["response_headers"] else {}
+            token_usage = _parse_json(row["token_usage"]) if row["token_usage"] else {}
+            has_resp = row["response_status"] is not None
+
+            item = {
+                "request_id": req.get("request_id", ""),
+                "ts": req.get("ts", ""),
+                "method": req.get("method", "?"),
+                "host": req.get("host", "?"),
+                "path": req.get("path", "?"),
+                "model": req.get("model", "?") or "?",
+                "confidence": req.get("confidence", 0),
+                "signals": req.get("signals", []),
+                "preview": req.get("preview", ""),
+                "stream_mode": req.get("stream_mode", False),
+                "session_id": req.get("session_id", ""),
+                "agent_id": req.get("agent_id", ""),
+                "app_name": req.get("app_name", "unknown"),
+                "request_body": req.get("request_body"),
+                "request_body_raw": (json.dumps(req.get("request_body"), ensure_ascii=False)[:2000]
+                                     if req.get("request_body") else ""),
+                "response_status": row["response_status"],
+                "response_headers": resp_headers,
+                "response_body": resp_body,
+                "response_body_raw": (json.dumps(resp_body, ensure_ascii=False)[:4000]
+                                      if resp_body else ""),
+                "token_usage": token_usage,
+                "latency_ms": row["latency_ms"],
+                "has_response": has_resp,
+                "error": None,
+            }
+            item["tools_defined"], item["tool_calls"], item["has_skill"] = \
+                extract_tool_calls(req.get("request_body"), resp_body)
+            result.append(item)
+
+        return result
+    finally:
+        db.close()
 
 
 def _get_conversation_key(event):
@@ -295,89 +331,93 @@ def _get_conversation_key(event):
     return (app_name, first_user)
 
 
-def get_traces(events):
-    """Group AI requests by conversation for trace view.
+def get_traces(limit=50):
+    """Group AI requests by conversation for trace view — SQL queries, not O(n) scan."""
+    db = get_db()
+    try:
+        # Get recent AI request events with matching responses
+        rows = db.execute("""
+            SELECT r.*, resp.response_status, resp.response_body, resp.token_usage, resp.latency_ms
+            FROM events r
+            LEFT JOIN events resp ON r.request_id = resp.request_id
+                AND resp.event = 'ai_response'
+            WHERE r.event = 'ai_request_audited'
+            ORDER BY r.ts_unix DESC
+            LIMIT 1000
+        """).fetchall()
 
-    A conversation = sequence of requests with the same app_name (process name)
-    and the same first user message. Message count grows within a conversation
-    as the agent sends tool calls and receives results.
-    Browser prediction requests (app_name="Browser-Predict") are filtered out.
-    """
-    # Collect all AI request/response events
-    ai_events = [e for e in events
-                 if e.get("event") in ("ai_request_audited", "ai_response", "ai_forward_error")]
+        events = []
+        for row in rows:
+            evt = _row_to_event(row)
+            # Merge response fields into the event for trace processing
+            evt["response_status"] = row["response_status"]
+            evt["response_body"] = _parse_json(row["response_body"]) if row["response_body"] else None
+            evt["token_usage"] = _parse_json(row["token_usage"]) if row["token_usage"] else {}
+            evt["latency_ms"] = row["latency_ms"]
+            events.append(evt)
 
-    # Group by conversation key = (app_name, first_user_msg)
-    convos = defaultdict(list)
-    for e in ai_events:
-        if e.get("event") == "ai_request_audited":
+        # Group by conversation key = (app_name, first_user_msg)
+        convos = defaultdict(list)
+        for e in events:
             key = _get_conversation_key(e)
-        else:
-            # Response/error events: find the matching request by request_id
-            rid = e.get("request_id", "")
-            key = None
-            for req_e in ai_events:
-                if req_e.get("request_id") == rid and req_e.get("event") == "ai_request_audited":
-                    key = _get_conversation_key(req_e)
-                    break
-            if key is None:
-                key = ("Unknown", "")
-        convos[key].append(e)
+            convos[key].append(e)
 
-    traces = []
-    for key, evts in convos.items():
-        app_name, first_user = key
-        evts.sort(key=lambda x: x.get("ts", ""))
+        traces = []
+        for key, evts in convos.items():
+            app_name, first_user = key
+            evts.sort(key=lambda x: x.get("ts", ""))
 
-        # Skip browser prediction conversations — not real agent sessions
-        if app_name == "Browser-Predict":
-            continue
+            # Skip browser prediction conversations — not real agent sessions
+            if app_name == "Browser-Predict":
+                continue
 
-        ai_reqs = [e for e in evts if e.get("event") == "ai_request_audited"]
-        if not ai_reqs:
-            continue
+            ai_reqs = evts
+            if not ai_reqs:
+                continue
 
-        total_tokens = 0
-        all_tool_calls = []
-        all_tools_defined = set()
-        has_skill = False
-        for e in ai_reqs:
-            tu = e.get("token_usage", {})
-            total_tokens += tu.get("total_tokens", 0) if tu else 0
-            req_body = e.get("request_body")
-            resp_body = e.get("response_body")
-            tools_def, tool_calls, skill = extract_tool_calls(req_body, resp_body)
-            if tool_calls:
-                all_tool_calls.append({
-                    "ts": e.get("ts", ""),
-                    "event": e.get("event", ""),
-                    "tool_calls": tool_calls,
-                })
-            for t in tools_def:
-                all_tools_defined.add(t)
-            if skill:
-                has_skill = True
+            total_tokens = 0
+            all_tool_calls = []
+            all_tools_defined = set()
+            has_skill = False
+            for e in ai_reqs:
+                tu = e.get("token_usage", {})
+                total_tokens += tu.get("total_tokens", 0) if tu else 0
+                req_body = e.get("request_body")
+                resp_body = e.get("response_body")
+                tools_def, tool_calls, skill = extract_tool_calls(req_body, resp_body)
+                if tool_calls:
+                    all_tool_calls.append({
+                        "ts": e.get("ts", ""),
+                        "event": e.get("event", ""),
+                        "tool_calls": tool_calls,
+                    })
+                for t in tools_def:
+                    all_tools_defined.add(t)
+                if skill:
+                    has_skill = True
 
-        traces.append({
-            "conversation_id": f"{app_name}:{first_user[:30]}",
-            "session_id": ai_reqs[0].get("session_id", ""),
-            "agent_id": ai_reqs[0].get("agent_id", ""),
-            "app_name": app_name,
-            "first_user_msg": first_user,
-            "request_count": len(ai_reqs),
-            "first_ts": ai_reqs[0].get("ts", ""),
-            "last_ts": ai_reqs[-1].get("ts", ""),
-            "total_tokens": total_tokens,
-            "tools_defined": sorted(all_tools_defined),
-            "tool_call_count": sum(len(tc["tool_calls"]) for tc in all_tool_calls),
-            "has_skill": has_skill,
-            "all_tool_calls": all_tool_calls,
-            "events": evts,
-        })
+            traces.append({
+                "conversation_id": f"{app_name}:{first_user[:30]}",
+                "session_id": ai_reqs[0].get("session_id", ""),
+                "agent_id": ai_reqs[0].get("agent_id", ""),
+                "app_name": app_name,
+                "first_user_msg": first_user,
+                "request_count": len(ai_reqs),
+                "first_ts": ai_reqs[0].get("ts", ""),
+                "last_ts": ai_reqs[-1].get("ts", ""),
+                "total_tokens": total_tokens,
+                "tools_defined": sorted(all_tools_defined),
+                "tool_call_count": sum(len(tc["tool_calls"]) for tc in all_tool_calls),
+                "has_skill": has_skill,
+                "all_tool_calls": all_tool_calls,
+                "events": evts,
+            })
 
-    # Sort by first_ts descending (newest first)
-    traces.sort(key=lambda t: t["first_ts"], reverse=True)
-    return traces
+        # Sort by first_ts descending (newest first)
+        traces.sort(key=lambda t: t["first_ts"], reverse=True)
+        return traces[:limit]
+    finally:
+        db.close()
 
 
 def esc(s):
@@ -395,39 +435,31 @@ if os.path.exists(_TEMPLATE_PATH):
         _html_template = f.read()
 
 
-def render_html(stats, events):
+def render_html(stats, requests):
     """Render the full dashboard HTML page."""
-    host_rows = "".join(
-        f'<tr><td>{esc(h["host"])}</td><td><span class="badge {h["decision"].lower()}">{h["decision"]}</span></td><td>{h["count"]}</td></tr>'
-        for h in stats["hosts"]
-    )
-    if not host_rows:
-        host_rows = '<tr><td colspan="3" class="empty">暂无</td></tr>'
-
+    if not _html_template:
+        return "<h1>Dashboard template not found</h1>"
     html = _html_template
-    html = html.replace("__TOTAL__", str(stats["total"]))
-    html = html.replace("__BLOCKED__", str(stats["blocked_count"]))
-    html = html.replace("__FORWARDED__", str(stats["forwarded_count"]))
-    html = html.replace("__AUDITED__", str(stats["audited_count"]))
-    html = html.replace("__HOST_ROWS__", host_rows)
-    html = html.replace("__TIMELINE_DATA__", json.dumps(stats["timeline"]))
-    html = html.replace("__MODEL_DATA__", json.dumps(stats["models"]))
+    html = html.replace("{{TOTAL}}", str(stats.get("total", 0)))
+    html = html.replace("{{BLOCKED}}", str(stats.get("blocked_count", 0)))
+    html = html.replace("{{FORWARDED}}", str(stats.get("forwarded_count", 0)))
+    html = html.replace("{{AUDITED}}", str(stats.get("audited_count", 0)))
     return html
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass
+        pass  # suppress access logs
 
     def do_GET(self):
         path = urlparse(self.path).path
 
         if path == "/api/data":
-            events = read_audit_events()
-            stats = get_stats(events)
-            requests = get_ai_requests(events)
-            traces = get_traces(events)
-            # Convert timestamps to local time for display
+            stats = get_stats()
+            requests = get_ai_requests(200)
+            traces = get_traces(50)
+
+            # Convert timestamps for display
             for r in requests:
                 r["ts"] = to_local_time_str(r.get("ts", ""))
             for t in traces:
@@ -439,7 +471,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "stats": stats,
                 "requests": requests[:200],
                 "traces": traces[:50],
-                "total_events": len(events),
+                "total_events": stats["total"],
             }
             body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
             self.send_response(200)
@@ -449,13 +481,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
         elif path == "/api/refresh":
-            events = read_audit_events()
-            stats = get_stats(events)
+            stats = get_stats()
+            db = get_db()
+            try:
+                blocked = [_row_to_event(r) for r in db.execute(
+                    "SELECT * FROM events WHERE decision='BLOCK' ORDER BY id DESC LIMIT 10").fetchall()]
+                forwarded = [_row_to_event(r) for r in db.execute(
+                    "SELECT * FROM events WHERE decision='FORWARD' ORDER BY id DESC LIMIT 5").fetchall()]
+                audited = [_row_to_event(r) for r in db.execute(
+                    "SELECT * FROM events WHERE decision='AUDIT' ORDER BY id DESC LIMIT 10").fetchall()]
+            finally:
+                db.close()
             data = {
                 "stats": stats,
-                "recent_blocked": [e for e in events if e.get("decision") == "BLOCK"][-10:],
-                "recent_forwarded": [e for e in events if e.get("decision") == "FORWARD"][-5:],
-                "recent_audited": [e for e in events if e.get("decision") == "AUDIT"][-10:],
+                "recent_blocked": blocked,
+                "recent_forwarded": forwarded,
+                "recent_audited": audited,
             }
             body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
             self.send_response(200)
@@ -465,17 +506,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
         elif path == "/api/events":
-            events = read_audit_events()
-            stats = get_stats(events)
-            blocked = [e for e in events if e.get("decision") == "BLOCK"]
-            audited = [e for e in events if e.get("decision") == "AUDIT"]
-            forwarded = [e for e in events if e.get("decision") == "FORWARD"]
+            stats = get_stats()
+            db = get_db()
+            try:
+                blocked = [_row_to_event(r) for r in db.execute(
+                    "SELECT * FROM events WHERE decision='BLOCK' ORDER BY id DESC LIMIT 100").fetchall()]
+                audited = [_row_to_event(r) for r in db.execute(
+                    "SELECT * FROM events WHERE decision='AUDIT' ORDER BY id DESC LIMIT 100").fetchall()]
+                forwarded = [_row_to_event(r) for r in db.execute(
+                    "SELECT * FROM events WHERE decision='FORWARD' ORDER BY id DESC LIMIT 50").fetchall()]
+            finally:
+                db.close()
             data = {
                 "stats": stats,
-                "blocked": blocked[-100:],
-                "audited": audited[-100:],
-                "forwarded": forwarded[-50:],
-                "total_events": len(events),
+                "blocked": blocked,
+                "audited": audited,
+                "forwarded": forwarded,
+                "total_events": stats["total"],
             }
             body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
             self.send_response(200)
@@ -485,9 +532,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
         elif path == "/" or path == "/index.html":
-            events = read_audit_events()
-            stats = get_stats(events)
-            html = render_html(stats, events).encode("utf-8")
+            stats = get_stats()
+            requests = get_ai_requests(200)
+            html = render_html(stats, requests).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", len(html))
@@ -510,9 +557,9 @@ def main():
         allow_reuse_address = True
 
     print(f"{'='*50}")
-    print(f"AgentGateway Dashboard v2.0")
+    print(f"AgentGateway Dashboard v3.0 (SQLite)")
     print(f"  URL:   http://{DASHBOARD_HOST}:{DASHBOARD_PORT}")
-    print(f"  Audit: {AUDIT_LOG}")
+    print(f"  DB:    {AUDIT_DB}")
     print(f"  TZ:    Asia/Shanghai (UTC+8)")
     print(f"{'='*50}")
 

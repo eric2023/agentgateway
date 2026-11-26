@@ -13,7 +13,11 @@
 #        sudo bash setup_iptables.sh --cleanup  # remove iptables rules
 
 set -uo pipefail
-
+# Fix HOME when invoked via sudo without --preserve-env
+if [[ -n "${SUDO_USER:-}" && "$HOME" == "/root" ]]; then
+    SUDO_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+    [[ -n "$SUDO_HOME" ]] && HOME="$SUDO_HOME"
+fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IPTABLES="/usr/sbin/iptables-legacy"
 CGROUP_DIR="/sys/fs/cgroup/net_cls/agentgateway"
@@ -39,7 +43,7 @@ Usage: sudo bash setup_iptables.sh [选项]
   1. modprobe xt_cgroup — 加载 cgroup 匹配内核模块
   2. 创建 cgroup /sys/fs/cgroup/net_cls/agentgateway（classid 0x100001）
   3. chmod 666 tasks — 允许普通用户 agw-admit 写入
-  4. 安装 mitmproxy CA 到 /etc/ssl/certs/agentgateway-ca.pem
+  4. 安装 mitmproxy CA 到 /usr/local/share/ca-certificates/agentgateway-ca.crt
   5. 设置 iptables-legacy REDIRECT 规则（:443 :8443 :9443 → :8444）
 
 验证:  /usr/sbin/iptables-legacy -t nat -L OUTPUT -n

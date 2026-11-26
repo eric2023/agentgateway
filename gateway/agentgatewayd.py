@@ -111,33 +111,145 @@ AI_BODY_SIGNALS = [
     "usage", "prompt_tokens", "completion_tokens",
 ]
 
-# ─── Audit Logging ────────────────────────────────────────────────────────────
+# ─── Audit Logging (SQLite + JSONL dual-write) ───────────────────────────────
+
+import sqlite3
 
 _audit_lock = threading.Lock()
 _audit_file = None
+_audit_db = None
+
+_AUDIT_DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL,
+    ts_unix     REAL NOT NULL,
+    event       TEXT NOT NULL,
+    decision    TEXT,
+    request_id  TEXT,
+    agent_id    TEXT,
+    session_id  TEXT,
+    app_name    TEXT,
+    method      TEXT,
+    host        TEXT,
+    port        INTEGER,
+    path        TEXT,
+    model       TEXT,
+    confidence  INTEGER,
+    signals     TEXT,
+    preview     TEXT,
+    prompt_len  INTEGER,
+    stream_mode INTEGER,
+    request_headers  TEXT,
+    request_body     TEXT,
+    response_status  INTEGER,
+    response_headers TEXT,
+    response_body    TEXT,
+    token_usage TEXT,
+    latency_ms  INTEGER,
+    summary     TEXT,
+    source      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ts     ON events(ts_unix DESC);
+CREATE INDEX IF NOT EXISTS idx_req_id ON events(request_id);
+CREATE INDEX IF NOT EXISTS idx_agent  ON events(agent_id);
+CREATE INDEX IF NOT EXISTS idx_event  ON events(event);
+"""
+
+_MAX_BODY_SIZE = 64 * 1024  # 64KB — truncate request_body / response_body
+
+def _truncate_body(body):
+    """Truncate body (dict/str) to _MAX_BODY_SIZE as JSON string."""
+    if body is None:
+        return None
+    s = json.dumps(body, ensure_ascii=False, default=str)
+    return s[:_MAX_BODY_SIZE] if len(s) > _MAX_BODY_SIZE else s
 
 def audit_init():
-    global _audit_file
+    """Initialize audit logging — SQLite (primary) + JSONL (human-readable backup)."""
+    global _audit_file, _audit_db
     os.makedirs(AUDIT_DIR, exist_ok=True)
-    path = os.path.join(AUDIT_DIR, "audit.jsonl")
-    _audit_file = open(path, "a", buffering=1)  # line-buffered
-    log(f"[AUDIT] Logging to {path}")
+
+    # SQLite setup
+    db_path = os.path.join(AUDIT_DIR, "audit.db")
+    _audit_db = sqlite3.connect(db_path, timeout=5, check_same_thread=False)
+    _audit_db.row_factory = sqlite3.Row
+    _audit_db.execute("PRAGMA journal_mode=WAL")
+    _audit_db.execute("PRAGMA synchronous=NORMAL")
+    _audit_db.executescript(_AUDIT_DB_SCHEMA)
+
+    # Clean old events: keep last 7 days or 50000 rows, whichever is smaller
+    cutoff = time.time() - 7 * 86400
+    _audit_db.execute("DELETE FROM events WHERE ts_unix < ?", (cutoff,))
+    _audit_db.execute(
+        "DELETE FROM events WHERE id NOT IN "
+        "(SELECT id FROM events ORDER BY id DESC LIMIT 50000)"
+    )
+    _audit_db.commit()
+    log(f"[AUDIT] SQLite: {db_path}")
+
+    # JSONL backup (optional, line-buffered)
+    jsonl_path = os.path.join(AUDIT_DIR, "audit.jsonl")
+    _audit_file = open(jsonl_path, "a", buffering=1)
 
 def audit_log(event):
-    """Write an audit event. Thread-safe."""
+    """Write an audit event to SQLite + JSONL. Thread-safe."""
     event["ts"] = datetime.now(timezone.utc).isoformat()
     event["ts_unix"] = time.time()
+
     line = json.dumps(event, ensure_ascii=False, default=str)
     with _audit_lock:
+        # SQLite insert
+        if _audit_db:
+            _audit_db.execute(
+                """INSERT INTO events (
+                    ts, ts_unix, event, decision, request_id, agent_id, session_id,
+                    app_name, method, host, port, path, model, confidence, signals,
+                    preview, prompt_len, stream_mode, request_headers, request_body,
+                    response_status, response_headers, response_body,
+                    token_usage, latency_ms, summary, source
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    event.get("ts", ""),
+                    event.get("ts_unix", 0),
+                    event.get("event", ""),
+                    event.get("decision"),
+                    event.get("request_id"),
+                    event.get("agent_id"),
+                    event.get("session_id"),
+                    event.get("app_name"),
+                    event.get("method"),
+                    event.get("host"),
+                    event.get("port"),
+                    event.get("path"),
+                    event.get("model"),
+                    event.get("confidence"),
+                    json.dumps(event.get("signals", []), ensure_ascii=False),
+                    event.get("preview"),
+                    event.get("prompt_len"),
+                    1 if event.get("stream_mode") else 0,
+                    json.dumps(event.get("request_headers", {}), ensure_ascii=False),
+                    _truncate_body(event.get("request_body")),
+                    event.get("response_status"),
+                    json.dumps(event.get("response_headers", {}), ensure_ascii=False),
+                    _truncate_body(event.get("response_body")),
+                    json.dumps(event.get("token_usage", {}), ensure_ascii=False),
+                    event.get("latency_ms"),
+                    event.get("summary"),
+                    event.get("source"),
+                ),
+            )
+            _audit_db.commit()
+        # JSONL backup
         if _audit_file:
             _audit_file.write(line + "\n")
-    # Also print to stdout for real-time visibility
+
+    # Print to stdout for real-time visibility
     decision = event.get("decision", "")
     summary = event.get("summary", "")
     if decision == "BLOCK":
         print(f"  🚫 BLOCK  │ {event.get('method','')} {event.get('path','')} │ {summary}")
     elif decision == "FORWARD":
-        # Only print non-trivial forwards
         pass
     else:
         print(f"  📋 {decision or 'EVENT':6s} │ {summary}")
@@ -482,7 +594,7 @@ def detect_ai_response(body_bytes):
 
 # ─── Peer Process Identification ─────────────────────────────────────────────
 
-_proc_cache = {}          # port → (pid, comm, app_name, ts)
+_proc_cache = {}          # port → (pid, comm, app_name, agent_id, session_id, ts)
 _proc_cache_lock = threading.Lock()
 _proc_cache_ttl = 30.0    # seconds
 # Limit concurrent /proc/*/fd scans — each scan does thousands of readlinks.
