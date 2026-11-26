@@ -20,6 +20,7 @@ if [[ -n "${SUDO_USER:-}" && "$HOME" == "/root" ]]; then
 fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IPTABLES="/usr/sbin/iptables-legacy"
+CGROUP_DIR="/sys/fs/cgroup/net_cls/agentgateway"
 CLASSID="0x100001"
 REDIRECT_PORT=8444
 PROXY_GID=""
