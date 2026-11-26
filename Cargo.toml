@@ -1,0 +1,28 @@
+[package]
+name = "agentgateway"
+version = "0.1.0"
+edition = "2021"
+description = "Transparent MITM proxy for AI request auditing — Rust async core"
+
+[dependencies]
+tokio = { version = "=1.41.1", features = ["full"] }
+hyper = { version = "=1.5.1", features = ["full"] }
+hyper-util = { version = "=0.1.10", features = ["full"] }
+http-body-util = "=0.1.2"
+bytes = "=1.9.0"
+rustls = "=0.23.18"
+tokio-rustls = "=0.26.0"
+rcgen = { version = "=0.13.2", features = ["x509-parser", "pem"] }
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+serde = { version = "=1.0.215", features = ["derive"] }
+serde_json = "=1.0.133"
+clap = { version = "=4.5.21", features = ["derive"] }
+libc = "=0.2.167"
+rustls-pemfile = "=2.2.0"
+time = "=0.3.37"
+zeroize = "=1.8.1"
+indexmap = "=2.7.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

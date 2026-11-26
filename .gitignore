@@ -10,7 +10,9 @@ logs/
 # Audit data (runtime-generated, may contain sensitive content)
 audit/audit.jsonl
 audit/audit-tls.jsonl
-audit/test_report.md
+audit/audit.db
+audit/audit.db-shm
+audit/audit.db-wal
 
 # Python
 *.pyc
@@ -33,3 +35,8 @@ bpf/seccomp_confirm
 .DS_Store
 *.swp
 *~
+
+
+# Added by cargo
+
+/target

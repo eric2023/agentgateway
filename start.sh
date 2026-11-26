@@ -1,8 +1,8 @@
 #!/bin/bash
-# start.sh — Start AgentGateway (mitmproxy transparent proxy) + Dashboard.
+# start.sh — Start AgentGateway (Rust transparent proxy) + Dashboard.
 #
 # Usage:
-#   ./start.sh start      # start mitmproxy + dashboard (background)
+#   ./start.sh start      # start Rust proxy + dashboard (background)
 #   ./start.sh -d         # same as start (daemon mode)
 #   ./start.sh fg         # start in foreground (Ctrl+C to stop both)
 #   ./start.sh stop       # stop both
@@ -13,7 +13,6 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ADDON="$PROJECT_DIR/gateway/agw_addon.py"
 DASHBOARD="$PROJECT_DIR/dashboard/dashboard.py"
 LOG_DIR="$PROJECT_DIR/logs"
 PROXY_LOG="$LOG_DIR/proxy.log"
@@ -25,7 +24,7 @@ PYTHON="$(command -v python3 || true)"
 if [[ -z "$PYTHON" ]]; then
     PYTHON="/home/ut000520@uos/.pyenv/shims/python3"
 fi
-MITMDUMP="$(command -v mitmdump || true)"
+PROXY_BIN="$PROJECT_DIR/target/release/agentgateway"
 PROXY_PORT=8444
 
 mkdir -p "$LOG_DIR"
@@ -77,17 +76,21 @@ start_proc() {
 # ─── proxy command ──────────────────────────────────────────────────────────
 
 proxy_cmd() {
-    if [[ -z "$MITMDUMP" ]]; then
-        echo "[start.sh] ERROR: mitmdump not found. Install with: pip3 install mitmproxy==5.3.0" >&2
+    # Use release binary if available, fall back to debug
+    if [[ -x "$PROXY_BIN" ]]; then
+        echo "$PROXY_BIN --host 127.0.0.1 --port $PROXY_PORT"
+    elif [[ -x "$PROJECT_DIR/target/debug/agentgateway" ]]; then
+        echo "$PROJECT_DIR/target/debug/agentgateway --host 127.0.0.1 --port $PROXY_PORT"
+    else
+        echo "[start.sh] ERROR: agentgateway binary not found. Build with: cargo build --release" >&2
         exit 1
     fi
-    echo "$MITMDUMP --mode transparent --listen-host 127.0.0.1 --listen-port $PROXY_PORT --set ssl_insecure=true -s $ADDON"
 }
 
 # ─── actions ────────────────────────────────────────────────────────────────
 
 do_stop() {
-    stop_proc "mitmproxy" "$PROXY_PIDFILE"
+    stop_proc "proxy" "$PROXY_PIDFILE"
     stop_proc "dashboard" "$DASHBOARD_PIDFILE"
 }
 
@@ -103,13 +106,13 @@ do_start() {
         echo "[start.sh] WARNING: cgroup not ready. Run './start.sh setup' first."
     fi
 
-    start_proc "mitmproxy" "$(proxy_cmd)" "$PROXY_PIDFILE" "$PROXY_LOG"
-    sleep 1.5   # let mitmproxy bind the port before dashboard
+    start_proc "proxy" "$(proxy_cmd)" "$PROXY_PIDFILE" "$PROXY_LOG"
+    sleep 0.5   # let proxy bind the port before dashboard
     start_proc "dashboard" "$PYTHON $DASHBOARD" "$DASHBOARD_PIDFILE" "$DASHBOARD_LOG"
 
     echo
     echo "[start.sh] ─────────────────────────────────────"
-    echo "[start.sh] mitmproxy (transparent): 127.0.0.1:$PROXY_PORT"
+    echo "[start.sh] proxy (transparent): 127.0.0.1:$PROXY_PORT"
     echo "[start.sh] Dashboard:               http://127.0.0.1:9090"
     echo "[start.sh] Logs:  $PROXY_LOG"
     echo "[start.sh]        $DASHBOARD_LOG"
@@ -121,11 +124,11 @@ do_foreground() {
     # Stop any background instances.
     do_stop 2>/dev/null || true
 
-    echo "[start.sh] Starting mitmproxy (foreground) ..."
+    echo "[start.sh] Starting proxy (foreground) ..."
     bash -c "$(proxy_cmd)" >>"$PROXY_LOG" 2>&1 &
     PROXY_PID=$!
     echo "$PROXY_PID" > "$PROXY_PIDFILE"
-    echo "[start.sh] mitmproxy pid=$PROXY_PID"
+    echo "[start.sh] proxy pid=$PROXY_PID"
 
     sleep 1.5
 
@@ -136,7 +139,7 @@ do_foreground() {
     echo "[start.sh] Dashboard pid=$DASH_PID"
 
     echo
-    echo "[start.sh] mitmproxy (transparent): 127.0.0.1:$PROXY_PORT"
+    echo "[start.sh] proxy (transparent): 127.0.0.1:$PROXY_PORT"
     echo "[start.sh] Dashboard:               http://127.0.0.1:9090"
     echo "[start.sh] Press Ctrl+C to stop both."
     echo
@@ -158,9 +161,9 @@ do_foreground() {
 
 do_status() {
     if is_running "$PROXY_PIDFILE"; then
-        echo "[start.sh] mitmproxy: running (pid=$(cat "$PROXY_PIDFILE"))"
+        echo "[start.sh] proxy: running (pid=$(cat "$PROXY_PIDFILE"))"
     else
-        echo "[start.sh] mitmproxy: stopped"
+        echo "[start.sh] proxy: stopped"
     fi
     if is_running "$DASHBOARD_PIDFILE"; then
         echo "[start.sh] Dashboard: running (pid=$(cat "$DASHBOARD_PIDFILE"))"
@@ -191,17 +194,17 @@ AgentGateway 生命周期管理脚本
 Usage: ./start.sh {start|stop|restart|status|fg|setup}
 
 命令:
-  start     启动 mitmproxy + dashboard（后台，默认）
+  start     启动 proxy + dashboard（后台，默认）
   -d        同 start（daemon 模式）
   fg        前台运行（Ctrl+C 停止两者）
-  stop      停止 mitmproxy + dashboard
+  stop      停止 proxy + dashboard
   restart   重启两者
   status    查看运行状态
   setup     一次性 root 设置（iptables + cgroup + CA）
   -h, --help  显示此帮助信息
 
 端口:
-  mitmproxy (transparent):  127.0.0.1:8444
+  proxy (transparent):  127.0.0.1:8444
   Dashboard:                http://127.0.0.1:9090
 EOF
         ;;
