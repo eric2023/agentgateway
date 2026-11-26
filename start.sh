@@ -71,13 +71,34 @@ stop_proc() {
     rm -f "$pidfile"
 }
 
-# Kill any stale process listening on the proxy port (e.g. orphaned agentgateway
-# whose pidfile was lost or pointed at the wrong PID). Prevents AddrInUse.
-kill_stale_proxy() {
-    local pids
-    pids="$(ss -tlnpH 2>/dev/null | grep ":$PROXY_PORT " | grep -oP 'pid=\K[0-9]+' || true)"
+# Kill any stale process listening on the proxy or dashboard port.
+# Handles cases where ss can't show PID (e.g. process under sg/root).
+# Searches /proc/*/fd for the socket inode.
+kill_stale_proc_on_port() {
+    local port=$1 label=$2
+    # Convert port to hex for /proc/net/tcp (little-endian)
+    local hex_port
+    hex_port=$(printf '%04X' "$port")
+    # Get all socket inodes listening on this port
+    local inodes
+    inodes=$(awk -v p=":$hex_port " '$2 ~ p && $4=="0A" {print $10}' /proc/net/tcp 2>/dev/null)
+    if [[ -z "$inodes" ]]; then
+        return 0
+    fi
+    local pids=""
+    for inode in $inodes; do
+        for f in /proc/[0-9]*/fd/*; do
+            if [[ "$(readlink "$f" 2>/dev/null)" == "socket:[$inode]" ]]; then
+                local pid
+                pid=$(echo "$f" | grep -oP '/proc/\K[0-9]+')
+                pids="$pids $pid"
+                break
+            fi
+        done 2>/dev/null
+    done
+    pids=$(echo "$pids" | tr ' ' '\n' | sort -u | grep -v '^$')
     if [[ -n "$pids" ]]; then
-        echo "[start.sh] Killing stale process on port $PROXY_PORT (pid=$pids) ..."
+        echo "[start.sh] Killing stale $label on port $port (pid=$(echo $pids | tr '\n' ' ')) ..."
         for p in $pids; do
             kill "$p" 2>/dev/null || true
         done
@@ -87,6 +108,11 @@ kill_stale_proxy() {
         done
         sleep 0.5
     fi
+}
+
+kill_stale_proxy() {
+    kill_stale_proc_on_port "$PROXY_PORT" "proxy"
+    kill_stale_proc_on_port 9090 "dashboard"
 }
 
 # start_proc accepts a full command string (supports args).
