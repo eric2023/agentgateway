@@ -23,7 +23,7 @@ pub async fn handle_connection(
     let orig_dst = get_original_dst(&client)?;
 
     // Peek first bytes to detect TLS ClientHello
-    let mut peek_buf = [0u8; 1024]; // enough for TLS record header + ClientHello
+    let mut peek_buf = [0u8; 16384]; // TLS record max = 16384 (was 1024, truncated extended ClientHello)
     let n = match tokio::time::timeout(
         Duration::from_secs(30),
         client.peek(&mut peek_buf),

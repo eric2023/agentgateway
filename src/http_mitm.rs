@@ -162,63 +162,12 @@ pub async fn process_http(
     upstream.write_all(&req_data).await?;
     upstream.flush().await?;
 
-    // Read response from upstream and forward to client (with 60s timeout)
-    let resp_data = match tokio::time::timeout(
-        Duration::from_secs(60),
-        read_http_response(&mut upstream),
-    ).await {
-        Ok(Ok(data)) => data,
-        Ok(Err(e)) => return Err(Box::new(e)),
-        Err(_) => return Err("response read timeout".into()),
-    };
-
-    // If AI request, capture response metadata
+    // Stream response (replaces read_http_response + client.write_all)
     if let Some((req_id, t0)) = &request_id {
-        let latency_ms = t0.elapsed().as_millis() as i64;
-
-        let (status, resp_headers, resp_body) = parse_response_head(&resp_data).unwrap_or((0, Vec::new(), Vec::new()));
-
-        let resp_body_json: Option<serde_json::Value> = serde_json::from_slice(&resp_body).ok();
-
-        // Extract token usage
-        let token_usage = resp_body_json.as_ref().and_then(|j| j.get("usage")).map(|u| u.clone());
-
-        let event = AuditEvent {
-            event: "ai_response".to_string(),
-            decision: String::new(),
-            request_id: req_id.clone(),
-            agent_id: String::new(),
-            session_id: String::new(),
-            app_name: String::new(),
-            method: String::new(),
-            host: String::new(),
-            port: 0,
-            path: String::new(),
-            model: String::new(),
-            confidence: 0,
-            signals: Vec::new(),
-            preview: String::new(),
-            prompt_len: 0,
-            stream_mode: false,
-            request_headers: None,
-            request_body: None,
-            response_status: Some(status as i64),
-            response_headers: headers_to_json(&resp_headers),
-            response_body: resp_body_json,
-            token_usage,
-            latency_ms: Some(latency_ms),
-            summary: format!("Response {} ({}ms)", status, latency_ms),
-            source: "rust_proxy".to_string(),
-        };
-
-        audit_log(&event);
+        stream_http_response(&mut upstream, client, req_id, *t0).await
+    } else {
+        stream_response_simple(&mut upstream, client).await
     }
-
-    // Forward response to client
-    client.write_all(&resp_data).await?;
-    client.flush().await?;
-
-    Ok(())
 }
 
 /// Read a complete HTTP request from a TLS stream.
@@ -270,60 +219,138 @@ async fn read_http_request<R: AsyncReadExt + Unpin>(
 
     Ok(Some(buf))
 }
-
-/// Read a complete HTTP response from a TLS stream.
-/// Handles Content-Length, chunked, and Connection: close.
-async fn read_http_response<R: AsyncReadExt + Unpin>(
-    reader: &mut R,
-) -> Result<Vec<u8>, std::io::Error> {
-    let mut buf = Vec::with_capacity(8192);
+/// Stream HTTP response from upstream to client: read headers, then pipe body.
+/// Records response audit event with status, headers, and body preview (first 4KB).
+async fn stream_http_response(
+    upstream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    client: &mut TlsStream<TcpStream>,
+    req_id: &str,
+    t0: Instant,
+) -> Result<(), BoxError> {
+    // 1. Read response headers (up to \r\n\r\n), with 60s timeout
+    let mut header_buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 4096];
-
-    // Read until we find \r\n\r\n
-    loop {
-        let n = reader.read(&mut tmp).await?;
+    let header_end = loop {
+        let n = tokio::time::timeout(
+            Duration::from_secs(60),
+            upstream.read(&mut tmp),
+        ).await
+            .map_err(|_| -> BoxError { "response header read timeout".into() })??;
         if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = find_header_end(&buf) {
-            let header_end = pos + 4;
-            let header_str = String::from_utf8_lossy(&buf[..pos]);
-
-            let is_chunked = is_chunked(&header_str);
-            let content_length = parse_content_length(&header_str);
-            let is_close = is_connection_close(&header_str);
-
-            if is_chunked {
-                // Read until chunked end marker
-                loop {
-                    if find_chunked_end(&buf, header_end).is_some() {
-                        break;
-                    }
-                    let n = reader.read(&mut tmp).await?;
-                    if n == 0 { break; }
-                    buf.extend_from_slice(&tmp[..n]);
-                }
-            } else if let Some(cl) = content_length {
-                while buf.len() < header_end + cl {
-                    let n = reader.read(&mut tmp).await?;
-                    if n == 0 { break; }
-                    buf.extend_from_slice(&tmp[..n]);
-                }
-            } else if is_close {
-                // Connection: close — read until EOF
-                loop {
-                    let n = reader.read(&mut tmp).await?;
-                    if n == 0 { break; }
-                    buf.extend_from_slice(&tmp[..n]);
-                }
+            if !header_buf.is_empty() {
+                client.write_all(&header_buf).await?;
+                client.flush().await?;
             }
-            // else: no body (204/304) or keep-alive without CL — just return headers
-            break;
+            return Ok(());
+        }
+        header_buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = find_header_end(&header_buf) {
+            client.write_all(&header_buf).await?;
+            client.flush().await?;
+            break pos + 4;
+        }
+    };
+
+    // 2. Parse response status + headers for audit
+    let header_str = String::from_utf8_lossy(&header_buf[..header_end - 4]);
+    let (status, resp_headers, _) = parse_response_head(&header_buf).unwrap_or((0, Vec::new(), Vec::new()));
+
+    // 3. Stream body to client, capturing first 4KB for audit preview
+    let mut body_preview = Vec::with_capacity(4096);
+    let body_start = &header_buf[header_end..];
+
+    if !body_start.is_empty() {
+        client.write_all(body_start).await?;
+        if body_preview.len() < 4096 {
+            let take = std::cmp::min(4096 - body_preview.len(), body_start.len());
+            body_preview.extend_from_slice(&body_start[..take]);
+        }
+    }
+    client.flush().await?;
+
+    // Stream remaining body with 300s idle timeout
+    let mut total_body: u64 = body_start.len() as u64;
+    let content_length = parse_content_length(&header_str);
+    loop {
+        let n = tokio::time::timeout(
+            Duration::from_secs(300),
+            upstream.read(&mut tmp),
+        ).await
+            .map_err(|_| -> BoxError { "response body read timeout".into() })??;
+        if n == 0 { break; }
+        client.write_all(&tmp[..n]).await?;
+        client.flush().await?;
+        if body_preview.len() < 4096 {
+            let take = std::cmp::min(4096 - body_preview.len(), n);
+            body_preview.extend_from_slice(&tmp[..take]);
+        }
+        total_body += n as u64;
+        if let Some(cl) = content_length {
+            if total_body >= cl as u64 { break; }
         }
     }
 
-    Ok(buf)
+    // 4. Record audit event
+    let latency_ms = t0.elapsed().as_millis() as i64;
+    let resp_body_json: Option<serde_json::Value> =
+        if body_preview.len() <= 4096 {
+            serde_json::from_slice(&body_preview).ok()
+        } else {
+            None
+        };
+    let token_usage = resp_body_json.as_ref()
+        .and_then(|j| j.get("usage"))
+        .map(|u| u.clone());
+
+    let event = AuditEvent {
+        event: "ai_response".to_string(),
+        decision: String::new(),
+        request_id: req_id.to_string(),
+        agent_id: String::new(),
+        session_id: String::new(),
+        app_name: String::new(),
+        method: String::new(),
+        host: String::new(),
+        port: 0,
+        path: String::new(),
+        model: String::new(),
+        confidence: 0,
+        signals: Vec::new(),
+        preview: String::new(),
+        prompt_len: 0,
+        stream_mode: false,
+        request_headers: None,
+        request_body: None,
+        response_status: Some(status as i64),
+        response_headers: headers_to_json(&resp_headers),
+        response_body: resp_body_json,
+        token_usage,
+        latency_ms: Some(latency_ms),
+        summary: format!("Response {} ({}ms, {}B)", status, latency_ms, total_body),
+        source: "rust_proxy".to_string(),
+    };
+    audit_log(&event);
+
+    Ok(())
+}
+
+/// Stream response for non-AI requests: just pipe bytes, no audit.
+async fn stream_response_simple(
+    upstream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    client: &mut TlsStream<TcpStream>,
+) -> Result<(), BoxError> {
+    let mut tmp = [0u8; 8192];
+    loop {
+        let n = tokio::time::timeout(
+            Duration::from_secs(300),
+            upstream.read(&mut tmp),
+        ).await
+            .map_err(|_| -> BoxError { "response read timeout".into() })??;
+        if n == 0 { break; }
+        client.write_all(&tmp[..n]).await?;
+        client.flush().await?;
+    }
+    Ok(())
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
