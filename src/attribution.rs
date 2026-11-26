@@ -75,8 +75,9 @@ pub fn lookup_peer(peer_port: u16, peer_ip: IpAddr) -> (Option<i32>, Option<Stri
     // Resolve agent process (walk parent chain)
     let (agent_pid, agent_comm) = resolve_agent_process(pid);
 
-    // Read env vars
-    let (mut app_name, mut agent_id, mut session_id) = read_env_vars(pid);
+    // Read env vars from the resolved agent process, not the tool process (R3-9)
+    let env_pid = agent_pid.unwrap_or(pid);
+    let (mut app_name, mut agent_id, mut session_id) = read_env_vars(env_pid);
 
     // Fall back to executable basename if AGENTGATEWAY_APP_NAME not set
     if app_name.is_none() {
@@ -127,15 +128,23 @@ fn find_socket_inode(peer_port: u16, exclude_port: u16) -> Option<String> {
                 if parts[3] != "01" {
                     continue; // not ESTABLISHED
                 }
-                let local_port = u16::from_str_radix(
-                    parts[1].split(':').nth(1)?, 16
-                ).ok()?;
+                let local_port = match parts[1].split(':').nth(1) {
+                    Some(s) => match u16::from_str_radix(s, 16) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    },
+                    None => continue,
+                };
                 if local_port != peer_port {
                     continue;
                 }
-                let remote_port = u16::from_str_radix(
-                    parts[2].split(':').nth(1)?, 16
-                ).ok()?;
+                let remote_port = match parts[2].split(':').nth(1) {
+                    Some(s) => match u16::from_str_radix(s, 16) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    },
+                    None => continue,
+                };
                 if remote_port == exclude_port {
                     continue;
                 }

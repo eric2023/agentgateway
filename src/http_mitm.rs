@@ -302,10 +302,11 @@ async fn stream_http_response(
     let is_chunked = is_chunked(&header_str);
     let content_length = parse_content_length(&header_str);
     let mut total_body: u64 = body_start.len() as u64;
-    // For chunked responses, accumulate body bytes to detect the 0\r\n\r\n terminator.
+    // For chunked responses, use a sliding window to detect the 0\r\n\r\n
+    // terminator without accumulating the entire body in memory (R3-4).
     // Content-Length responses just count bytes; connection-close responses pipe to EOF.
-    let mut body_buf = if is_chunked {
-        let mut v = Vec::new();
+    let mut tail_buf: Vec<u8> = if is_chunked {
+        let mut v = Vec::with_capacity(CHUNK_TAIL_LEN);
         v.extend_from_slice(body_start);
         v
     } else {
@@ -315,7 +316,7 @@ async fn stream_http_response(
         // Check termination BEFORE reading more (handles bodies already complete
         // in the header buffer, and stops as soon as the terminator is fully read).
         if is_chunked {
-            if find_chunked_end(&body_buf, 0).is_some() {
+            if has_chunked_terminator(&tail_buf) {
                 break;
             }
         } else if let Some(cl) = content_length {
@@ -337,7 +338,11 @@ async fn stream_http_response(
             body_preview.extend_from_slice(&tmp[..take]);
         }
         if is_chunked {
-            body_buf.extend_from_slice(&tmp[..n]);
+            tail_buf.extend_from_slice(&tmp[..n]);
+            if tail_buf.len() > CHUNK_TAIL_LEN {
+                let drain = tail_buf.len() - CHUNK_TAIL_LEN;
+                tail_buf.drain(..drain);
+            }
         }
         total_body += n as u64;
     }
@@ -431,8 +436,8 @@ async fn stream_response_simple(
         client.flush().await?;
     }
     let mut total_body: u64 = body_start.len() as u64;
-    let mut body_buf = if is_chunked {
-        let mut v = Vec::new();
+    let mut tail_buf: Vec<u8> = if is_chunked {
+        let mut v = Vec::with_capacity(CHUNK_TAIL_LEN);
         v.extend_from_slice(body_start);
         v
     } else {
@@ -443,7 +448,7 @@ async fn stream_response_simple(
     //    or Content-Length exhaustion (keeps the upstream reusable).
     loop {
         if is_chunked {
-            if find_chunked_end(&body_buf, 0).is_some() {
+            if has_chunked_terminator(&tail_buf) {
                 break;
             }
         } else if let Some(cl) = content_length {
@@ -461,13 +466,31 @@ async fn stream_response_simple(
         client.write_all(&tmp[..n]).await?;
         client.flush().await?;
         if is_chunked {
-            body_buf.extend_from_slice(&tmp[..n]);
+            tail_buf.extend_from_slice(&tmp[..n]);
+            if tail_buf.len() > CHUNK_TAIL_LEN {
+                let drain = tail_buf.len() - CHUNK_TAIL_LEN;
+                tail_buf.drain(..drain);
+            }
         }
         total_body += n as u64;
     }
 
     let resp_close = is_connection_close(&header_str);
     Ok(resp_close)
+}
+
+/// Sliding window size for chunked terminator detection (R3-4).
+/// Only the last N bytes of the chunked body are kept to detect "0\r\n\r\n".
+const CHUNK_TAIL_LEN: usize = 64 * 1024;
+
+/// Check if a chunked body buffer contains the "0\r\n\r\n" terminator.
+/// Matches either at the start of the body (single zero-size chunk) or
+/// after a chunk boundary ("\r\n0\r\n\r\n").
+fn has_chunked_terminator(buf: &[u8]) -> bool {
+    if buf.starts_with(b"0\r\n\r\n") {
+        return true;
+    }
+    buf.windows(7).any(|w| w == b"\r\n0\r\n\r\n")
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -477,19 +500,26 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 fn parse_content_length(header_str: &str) -> Option<usize> {
     for line in header_str.lines() {
         if line.to_lowercase().starts_with("content-length:") {
-            let val = line[15..].trim();
-            return val.parse().ok();
+            let val = line.splitn(2, ':').nth(1)?;
+            return val.trim().parse().ok();
         }
     }
     None
 }
 
 fn is_chunked(header_str: &str) -> bool {
-    header_str.to_lowercase().contains("transfer-encoding: chunked")
+    header_str.lines().any(|line| {
+        let l = line.to_lowercase();
+        l.starts_with("transfer-encoding:") && l.contains("chunked")
+    })
 }
 
 fn is_connection_close(header_str: &str) -> bool {
-    header_str.to_lowercase().contains("connection: close")
+    header_str.lines().any(|line| {
+        let l = line.to_lowercase();
+        l.starts_with("connection:")
+            && l.splitn(2, ':').nth(1).map(|v| v.trim() == "close").unwrap_or(false)
+    })
 }
 
 /// Find the end of a chunked-encoded body by parsing chunk boundaries.
@@ -518,7 +548,7 @@ fn find_chunked_end(buf: &[u8], start: usize) -> Option<usize> {
             return None; // trailer not yet received
         }
 
-        pos += chunk_size + 2; // chunk data + trailing \r\n
+        pos = pos.checked_add(chunk_size)?.checked_add(2)?; // chunk data + trailing \r\n
         if pos > buf.len() { return None; }
     }
 }

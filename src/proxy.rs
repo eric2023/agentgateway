@@ -200,7 +200,7 @@ async fn blind_tunnel(
                 Duration::from_secs(300),
                 cr.read(&mut buf),
             ).await
-                .map_err(|_| -> BoxError { "blind tunnel idle timeout".into() })??;
+            .map_err(|_| -> BoxError { "blind tunnel idle timeout (client→upstream)".into() })??;
             if n == 0 { return Ok::<(), BoxError>(()); }
             uw.write_all(&buf[..n]).await?;
             uw.flush().await?;
@@ -214,7 +214,7 @@ async fn blind_tunnel(
                 Duration::from_secs(300),
                 ur.read(&mut buf),
             ).await
-                .map_err(|_| -> BoxError { "blind tunnel idle timeout".into() })??;
+            .map_err(|_| -> BoxError { "blind tunnel idle timeout (upstream→client)".into() })??;
             if n == 0 { return Ok::<(), BoxError>(()); }
             cw.write_all(&buf[..n]).await?;
             cw.flush().await?;

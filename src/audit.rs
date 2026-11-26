@@ -257,6 +257,7 @@ pub fn flush() {
 /// Delete events older than 7 days or beyond 50000 rows.
 pub fn cleanup_old_events(db_path: &Path) -> Result<(), String> {
     let conn = Connection::open(db_path).map_err(|e| format!("open: {e}"))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(|e| format!("wal: {e}"))?;
     let cutoff = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
