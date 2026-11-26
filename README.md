@@ -4,7 +4,7 @@
 
 AgentGateway 通过 iptables REDIRECT + cgroup net_cls 进程级隔离，零改造拦截 agw-admit 纳入的 Agent 进程的所有 HTTPS 请求，对 AI 请求进行**审计记录并转发**（不阻断），捕获请求/响应内容、token 用量、工具调用链，并通过 Web 仪表盘实时展示。
 
-代理层基于 **Rust (tokio + rustls + hyper)**，异步多线程、内存可控（< 50MB），支持 TLS MITM、SSE 流式响应。审计存储使用 **SQLite WAL** 模式，Dashboard 通过 SQL 查询（无需全量读取），彻底解决了 mitmproxy 线程泄漏 + JSONL 全量读取导致的 22GB 内存泄漏问题。
+代理层基于 **Rust (tokio + rustls)**，异步多线程、内存可控（< 50MB），支持 TLS MITM、SSE 流式响应。审计存储使用 **SQLite WAL** 模式，Dashboard 通过 SQL 查询（无需全量读取），彻底解决了 mitmproxy 线程泄漏 + JSONL 全量读取导致的 22GB 内存泄漏问题。
 
 ## 架构
 
@@ -16,7 +16,7 @@ graph TB
     end
 
     subgraph 用户态["用户态"]
-        TP["agentgateway (Rust) :8444 (transparent)<br/>tokio + rustls + hyper<br/>AI 识别 + 审计 + 进程归因<br/>TLS MITM · SSE 流式"]
+        TP["agentgateway (Rust) :8444 (transparent)<br/>tokio + rustls<br/>AI 识别 + 审计 + 进程归因<br/>TLS MITM · SSE 流式"]
         DASH["dashboard.py :9090<br/>Web 仪表盘"]
         SETUP["setup_iptables.sh<br/>一次性 root 设置<br/>modprobe + cgroup + iptables + CA"]
     end
@@ -63,7 +63,7 @@ graph TB
 - **按进程拦截**：只有 agw-admit 纳入 cgroup 的进程的 :443 流量被重定向，其他所有进程（浏览器、邮件、应用商店）零影响
 - **Agent 零改造**：不设任何环境变量，不需要修改代码，不需要特殊启动参数
 - **不可绕过**：iptables NAT 在内核态重定向，Agent 无法绕过
-- **完整协议支持**：基于 Rust rustls + hyper，支持 TLS MITM、HTTP/1.1、SSE 流式响应
+- **完整协议支持**：基于 Rust rustls + 手写 HTTP/1.1 解析，支持 TLS MITM、HTTP/1.1、SSE 流式响应
 - **低内存**：Rust 异步代理（< 50MB RSS），SQLite WAL 审计存储 + SQL 查询 Dashboard（~20MB），彻底解决 mitmproxy 线程泄漏问题
 
 ## 目录结构
@@ -99,7 +99,7 @@ agentgateway/
 
 | 依赖 | 版本 | 说明 | 必需 |
 |------|------|------|------|
-| Rust | ≥ 1.84 | 代理核心（tokio + rustls + hyper） | ✅ |
+| Rust | ≥ 1.84 | 代理核心（tokio + rustls） | ✅ |
 | Python | ≥ 3.7 | 仪表盘 | ✅ |
 | iptables-legacy | 系统自带 | cgroup 匹配 + REDIRECT（4.19 默认安装） | ✅ |
 | xt_cgroup.ko | 内核模块 | iptables cgroup 匹配（4.19 默认提供） | ✅ |
@@ -342,6 +342,10 @@ sudo bash setup_iptables.sh --cleanup
 
 - [`specs/方案A_透明代理进程级拦截_4.19内核.md`](specs/方案A_透明代理进程级拦截_4.19内核.md) — 透明代理进程级拦截方案（当前实现，适用于 4.19 内核）
 - [`specs/方案B_BPF-LSM内核级管控_6.6内核.md`](specs/方案B_BPF-LSM内核级管控_6.6内核.md) — BPF-LSM 内核级管控方案（V25，含文件访问管控，适用于 6.6+ 内核）
+- [`specs/第三轮审查缺陷报告.md`](specs/第三轮审查缺陷报告.md) — 第三轮代码审查缺陷报告
+- [`specs/第四轮审查缺陷报告.md`](specs/第四轮审查缺陷报告.md) — 第四轮代码审查缺陷报告
+- [`specs/第五轮审查缺陷报告.md`](specs/第五轮审查缺陷报告.md) — 第五轮代码审查缺陷报告
+- [`specs/第六轮审查缺陷报告.md`](specs/第六轮审查缺陷报告.md) — 第六轮全文件逐行审查报告（无 P0/P1/P2 缺陷）
 
 ## 开源许可
 

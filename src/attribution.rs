@@ -36,9 +36,7 @@ const TOOL_PROCESSES: &[&str] = &[
     "supervisord", "systemd", "init",
 ];
 
-/// Look up the peer process for a given client connection.
-/// Uses (peer_port, peer_ip) as cache key to reduce port-reuse misattribution (C09).
-/// Returns (agent_pid, agent_comm, app_name, agent_id, session_id).
+/// Alias for the lookup_peer return tuple.
 pub type PeerInfo = (Option<i32>, Option<String>, Option<String>, Option<String>, Option<String>);
 
 /// Look up the peer process for a given client connection.
