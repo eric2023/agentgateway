@@ -138,7 +138,7 @@ pub async fn process_http(
             // Process attribution
             let peer_port = peer_addr.port();
             let (_agent_pid, _agent_comm, app_name, agent_id, session_id) =
-                attribution::lookup_peer(peer_port, peer_addr.ip());
+                attribution::lookup_peer(peer_port, peer_addr.ip(), orig_dst);
 
             let request_body_json: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
 
@@ -301,14 +301,16 @@ async fn stream_http_response(
     let header_str = String::from_utf8_lossy(&header_buf[..header_end - 4]);
     let (status, resp_headers, _) = parse_response_head(&header_buf).unwrap_or((0, Vec::new(), Vec::new()));
 
-    // 3. Stream body to client, capturing first 4KB for audit preview
-    let mut body_preview = Vec::with_capacity(4096);
+    // 3. Stream body to client, capturing first 64KB for audit
+    //    (streaming SSE responses need enough data to capture usage + tool_calls)
+    let body_preview_cap = 64 * 1024;
+    let mut body_preview = Vec::with_capacity(body_preview_cap);
     let body_start = &header_buf[header_end..];
 
     if !body_start.is_empty() {
         client.write_all(body_start).await?;
-        if body_preview.len() < 4096 {
-            let take = std::cmp::min(4096 - body_preview.len(), body_start.len());
+        if body_preview.len() < body_preview_cap {
+            let take = std::cmp::min(body_preview_cap - body_preview.len(), body_start.len());
             body_preview.extend_from_slice(&body_start[..take]);
         }
     }
@@ -349,8 +351,8 @@ async fn stream_http_response(
         if n == 0 { break; }
         client.write_all(&tmp[..n]).await?;
         client.flush().await?;
-        if body_preview.len() < 4096 {
-            let take = std::cmp::min(4096 - body_preview.len(), n);
+        if body_preview.len() < body_preview_cap {
+            let take = std::cmp::min(body_preview_cap - body_preview.len(), n);
             body_preview.extend_from_slice(&tmp[..take]);
         }
         if is_chunked {
@@ -365,14 +367,12 @@ async fn stream_http_response(
 
     // 4. Record audit event
     let latency_ms = t0.elapsed().as_millis() as i64;
-    let resp_body_json: Option<serde_json::Value> =
-        if body_preview.len() < 4096 {
-            serde_json::from_slice(&body_preview).ok()
-        } else {
-            None
-        };
-    let token_usage = resp_body_json.as_ref()
-        .and_then(|j| j.get("usage")).cloned();
+
+    // For streaming SSE responses, body_preview contains chunked SSE data like:
+    //   data: {"choices":[{"delta":{"content":"..."}}]}\r\n\r\n
+    // Extract usage/tool_calls from the last data: line, and try to reconstruct
+    // a JSON object from SSE chunks.
+    let (resp_body_json, token_usage) = parse_sse_or_json(&body_preview);
 
     let event = AuditEvent {
         event: "ai_response".to_string(),
@@ -405,6 +405,120 @@ async fn stream_http_response(
 
     let resp_close = is_connection_close(&header_str);
     Ok(resp_close)
+}
+
+/// Parse response body preview: try JSON first, then SSE stream data.
+/// For SSE streaming responses, extract usage from the last data: line and
+/// accumulate content/tool_calls from delta chunks.
+/// Returns (reconstructed_body_json, token_usage).
+fn parse_sse_or_json(body_preview: &[u8]) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    // Try plain JSON first (non-streaming responses)
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body_preview) {
+        let usage = v.get("usage").cloned();
+        return (Some(v), usage);
+    }
+
+    // Parse SSE lines: data: {...}\r\n
+    let text = String::from_utf8_lossy(body_preview);
+    let mut usage: Option<serde_json::Value> = None;
+    let mut content_parts: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+    let mut model: Option<String> = None;
+    let mut finish_reason: Option<String> = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with("data:") {
+            continue;
+        }
+        let data = line[5..].trim();
+        if data == "[DONE]" {
+            continue;
+        }
+        let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        // Extract usage from the final chunk
+        if let Some(u) = chunk.get("usage") {
+            usage = Some(u.clone());
+        }
+        if let Some(m) = chunk.get("model").and_then(|v| v.as_str()) {
+            model = Some(m.to_string());
+        }
+        // Extract delta content and tool_calls from choices[0].delta
+        if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
+            for choice in choices {
+                if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                    finish_reason = Some(fr.to_string());
+                }
+                if let Some(delta) = choice.get("delta") {
+                    if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                        content_parts.push(content.to_string());
+                    }
+                    if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                        for tc in tcs {
+                            // Accumulate tool call arguments across chunks
+                            let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            while tool_calls.len() <= idx {
+                                tool_calls.push(serde_json::json!({
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""}
+                                }));
+                            }
+                            let existing = &mut tool_calls[idx];
+                            if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                if !id.is_empty() {
+                                    existing["id"] = serde_json::Value::String(id.to_string());
+                                }
+                            }
+                            if let Some(func) = tc.get("function") {
+                                if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                    if !name.is_empty() {
+                                        existing["function"]["name"] = serde_json::Value::String(name.to_string());
+                                    }
+                                }
+                                if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                    if let Some(existing_args) = existing["function"]["arguments"].as_str() {
+                                        existing["function"]["arguments"] = serde_json::Value::String(format!("{}{}", existing_args, args));
+                                    } else {
+                                        existing["function"]["arguments"] = serde_json::Value::String(args.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Reconstruct a response-like JSON object
+    let content = content_parts.concat();
+    let message = if !tool_calls.is_empty() {
+        serde_json::json!({
+            "role": "assistant",
+            "content": if content.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(content) },
+            "tool_calls": tool_calls
+        })
+    } else {
+        serde_json::json!({
+            "role": "assistant",
+            "content": content
+        })
+    };
+
+    let body = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason.unwrap_or_else(|| "stop".to_string())
+        }],
+        "model": model.unwrap_or_default(),
+        "usage": usage
+    });
+
+    (Some(body), usage)
 }
 
 /// Stream response for non-AI requests: parse headers, then stream the body

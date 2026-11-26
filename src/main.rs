@@ -257,7 +257,8 @@ mod tests {
         // This test verifies the attribution module doesn't crash
         // with an invalid port (should return all None)
         let (pid, comm, app, agent, session) =
-            attribution::lookup_peer(65535, std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+            attribution::lookup_peer(65535, std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8444));
         assert!(pid.is_none());
         assert!(comm.is_none());
         assert!(app.is_none());

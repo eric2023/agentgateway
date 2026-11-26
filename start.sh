@@ -142,14 +142,12 @@ proxy_cmd() {
         echo "[start.sh] ERROR: agentgateway binary not found. Build with: cargo build --release" >&2
         exit 1
     fi
-    # Run under agwproxy GID so iptables --gid-owner exclusion prevents
-    # the proxy's upstream connections from being REDIRECTed back to itself.
-    if getent group agwproxy &>/dev/null; then
-        echo "ulimit -n 65536; sg agwproxy -c '$bin --host 127.0.0.1 --port $PROXY_PORT'"
-    else
-        echo "[start.sh] WARNING: agwproxy group not found, running without GID exclusion" >&2
-        echo "ulimit -n 65536; $bin --host 127.0.0.1 --port $PROXY_PORT"
-    fi
+    # Run as the current user (no sg agwproxy). The iptables REDIRECT rule only
+    # matches cgroup members (classid 0x100001), and the proxy is NOT in that
+    # cgroup, so its upstream connections are never redirected. Using sg agwproxy
+    # changes the effective GID, which breaks readlink on /proc/<pid>/fd/*
+    # (ptrace_may_access checks gid equality), making process attribution fail.
+    echo "ulimit -n 65536; $bin --host 127.0.0.1 --port $PROXY_PORT"
 }
 
 # ─── actions ────────────────────────────────────────────────────────────────

@@ -5,13 +5,12 @@
 //   2. Scanning /proc/*/fd/ to find which PID owns the socket
 //   3. Walking the parent chain to find the real agent process
 //   4. Reading AGENTGATEWAY_* env vars from /proc/<pid>/environ
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Mutex, LazyLock};
 use std::collections::HashSet;
 use std::fs;
 use std::time::{Duration, Instant};
 
-const LISTEN_PORT: u16 = 8444;
 const CACHE_TTL: Duration = Duration::from_secs(5); // reduced from 30s to 5s (C09)
 
 struct CacheEntry {
@@ -42,7 +41,7 @@ pub type PeerInfo = (Option<i32>, Option<String>, Option<String>, Option<String>
 /// Look up the peer process for a given client connection.
 /// Uses (peer_port, peer_ip) as cache key to reduce port-reuse misattribution (C09).
 /// Returns (agent_pid, agent_comm, app_name, agent_id, session_id).
-pub fn lookup_peer(peer_port: u16, peer_ip: IpAddr) -> PeerInfo {
+pub fn lookup_peer(peer_port: u16, peer_ip: IpAddr, orig_dst: SocketAddr) -> PeerInfo {
     // Check cache
     {
         let cache = CACHE.lock().unwrap();
@@ -59,21 +58,18 @@ pub fn lookup_peer(peer_port: u16, peer_ip: IpAddr) -> PeerInfo {
         }
     }
 
-    // Find socket inode
-    let inode = match find_socket_inode(peer_port, LISTEN_PORT) {
-        Some(i) => i,
-        None => {
-            return (None, None, None, None, None);
-        }
+    // Find PID by scanning process fd tables.
+    // iptables REDIRECT creates a kernel-internal socket entry in /proc/net/tcp
+    // that has no owning process fd, so matching by local_port alone fails.
+    // Instead, match by the original destination (orig_dst): the client's real
+    // socket has remote=orig_dst, and we find it by scanning process fds.
+    let pid = match find_pid_by_orig_dst(orig_dst, peer_ip) {
+        Some(p) => p,
+        None => return (None, None, None, None, None),
     };
 
-    // Find PID owning this socket
-    let pid = match find_pid_by_inode(&inode) {
-        Some(p) => p,
-        None => {
-            return (None, None, None, None, None);
-        }
-    };
+
+
 
     // Resolve agent process (walk parent chain)
     let (agent_pid, agent_comm) = resolve_agent_process(pid);
@@ -121,14 +117,43 @@ pub fn lookup_peer(peer_port: u16, peer_ip: IpAddr) -> PeerInfo {
 /// The client connected to :443, but iptables REDIRECT rewrote the destination
 /// to 127.0.0.1:8444. So the client socket in /proc/net/tcp shows:
 ///   client_ip:peer_port -> 127.0.0.1:8444
-/// We must NOT skip these — the old exclude_port check was wrong and skipped
-/// the very sockets we need.
-fn find_socket_inode(peer_port: u16, _exclude_port: u16) -> Option<String> {
+/// Convert an IP address to the hex format used in /proc/net/tcp.
+/// IPv4: "0100007F" (little-endian bytes)
+/// IPv6: 16 bytes in mixed endian (4 little-endian 32-bit words)
+fn ip_to_hex(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            format!("{:02X}{:02X}{:02X}{:02X}", octets[3], octets[2], octets[1], octets[0])
+        }
+        IpAddr::V6(v6) => {
+            // /proc/net/tcp6 uses 4 32-bit words in little-endian
+            let octets = v6.octets();
+            let mut words = Vec::new();
+            for i in (0..16).step_by(4) {
+                words.push(format!("{:02X}{:02X}{:02X}{:02X}", octets[i+3], octets[i+2], octets[i+1], octets[i]));
+            }
+            words.join("")
+        }
+    }
+}
+
+/// Find which PID owns a socket connected to orig_dst from peer_ip.
+/// Scans /proc/net/tcp for ESTABLISHED entries where remote=orig_dst and local_ip=peer_ip,
+/// collects the inodes, then scans /proc/*/fd to find the owning PID.
+fn find_pid_by_orig_dst(orig_dst: SocketAddr, peer_ip: IpAddr) -> Option<i32> {
+    let remote_ip_hex = ip_to_hex(orig_dst.ip());
+    let remote_port_hex = format!("{:04X}", orig_dst.port());
+    let local_ip_hex = ip_to_hex(peer_ip);
+    let remote_addr = format!("{}:{}", remote_ip_hex, remote_port_hex);
+
+    // Collect inodes from /proc/net/tcp where remote=orig_dst, local_ip=peer_ip, ESTABLISHED.
+    let mut target_inodes = HashSet::new();
     for proc_file in &["/proc/net/tcp", "/proc/net/tcp6"] {
         if let Ok(content) = fs::read_to_string(proc_file) {
             for (i, line) in content.lines().enumerate() {
                 if i == 0 {
-                    continue; // skip header
+                    continue;
                 }
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() < 10 {
@@ -137,37 +162,30 @@ fn find_socket_inode(peer_port: u16, _exclude_port: u16) -> Option<String> {
                 if parts[3] != "01" {
                     continue; // not ESTABLISHED
                 }
-                let local_port = match parts[1].split(':').nth(1) {
-                    Some(s) => match u16::from_str_radix(s, 16) {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    },
-                    None => continue,
-                };
-                if local_port != peer_port {
-                    continue;
+                let local = parts[1];
+                let remote = parts[2];
+                // Match remote == orig_dst and local_ip == peer_ip
+                if remote.eq_ignore_ascii_case(&remote_addr)
+                    && local.split(':').next().map(|s| s.eq_ignore_ascii_case(&local_ip_hex)).unwrap_or(false)
+                {
+                    target_inodes.insert(parts[9].to_string());
                 }
-                // Skip the proxy's own listening/accepted sockets (local addr = 127.0.0.1:8444)
-                // The proxy's accepted socket has local_port=8444, so it won't match peer_port.
-                // But the proxy's upstream socket has local_port=ephemeral, remote=443 — also won't match.
-                // The client socket has local_port=peer_port, remote=8444 (after REDIRECT).
-                return Some(parts[9].to_string());
             }
         }
     }
-    None
-}
 
-/// Scan /proc/*/fd/ to find which PID owns a socket with the given inode.
-fn find_pid_by_inode(inode: &str) -> Option<i32> {
-    let search_link = format!("socket:[{}]", inode);
+    if target_inodes.is_empty() {
+        return None;
+    }
+
+    // Scan /proc/*/fd for any process that owns one of these inodes.
+    // Note: readlink on /proc/<pid>/fd/<n> requires ptrace_may_access, which
+    // checks that caller gid == target gid. The proxy must run with the same
+    // effective GID as the target processes (i.e., NOT via sg agwproxy).
     let my_pid = std::process::id() as i32;
-
-    let proc_dirs = fs::read_dir("/proc").ok()?;
-    for entry in proc_dirs.flatten() {
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
         let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        let pid: i32 = match name_str.parse() {
+        let pid: i32 = match name.to_string_lossy().parse() {
             Ok(p) => p,
             Err(_) => continue,
         };
@@ -178,8 +196,11 @@ fn find_pid_by_inode(inode: &str) -> Option<i32> {
         if let Ok(fds) = fs::read_dir(&fd_dir) {
             for fd in fds.flatten() {
                 if let Ok(link) = fs::read_link(fd.path()) {
-                    if link.to_string_lossy() == search_link {
-                        return Some(pid);
+                    let link_str = link.to_string_lossy();
+                    if let Some(inode) = link_str.strip_prefix("socket:[").and_then(|s| s.strip_suffix(']')) {
+                        if target_inodes.contains(inode) {
+                            return Some(pid);
+                        }
                     }
                 }
             }
