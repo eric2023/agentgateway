@@ -143,7 +143,7 @@ do_foreground() {
     echo "$PROXY_PID" > "$PROXY_PIDFILE"
     echo "[start.sh] proxy pid=$PROXY_PID"
 
-    sleep 1.5
+    wait_for_port "$PROXY_PORT" 50 || echo "[start.sh] WARNING: proxy port not ready yet"
 
     echo "[start.sh] Starting dashboard (foreground) ..."
     "$PYTHON" "$DASHBOARD" >>"$DASHBOARD_LOG" 2>&1 &

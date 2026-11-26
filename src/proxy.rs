@@ -5,6 +5,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use crate::tls::Certifier;
 use crate::http_mitm::UpstreamConnector;
@@ -192,11 +193,35 @@ async fn blind_tunnel(
     let (mut cr, mut cw) = client.split();
     let (mut ur, mut uw) = upstream.split();
 
-    tokio::try_join!(
-        tokio::io::copy(&mut cr, &mut uw),
-        tokio::io::copy(&mut ur, &mut cw),
-    )?;
+    let client_to_upstream = async {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = tokio::time::timeout(
+                Duration::from_secs(300),
+                cr.read(&mut buf),
+            ).await
+                .map_err(|_| -> BoxError { "blind tunnel idle timeout".into() })??;
+            if n == 0 { return Ok::<(), BoxError>(()); }
+            uw.write_all(&buf[..n]).await?;
+            uw.flush().await?;
+        }
+    };
 
+    let upstream_to_client = async {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = tokio::time::timeout(
+                Duration::from_secs(300),
+                ur.read(&mut buf),
+            ).await
+                .map_err(|_| -> BoxError { "blind tunnel idle timeout".into() })??;
+            if n == 0 { return Ok::<(), BoxError>(()); }
+            cw.write_all(&buf[..n]).await?;
+            cw.flush().await?;
+        }
+    };
+
+    tokio::try_join!(client_to_upstream, upstream_to_client)?;
     Ok(())
 }
 

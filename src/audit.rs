@@ -3,7 +3,7 @@
 // Uses a dedicated writer thread (mpsc channel) to avoid blocking the async runtime (C04).
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender, Receiver};
+use std::sync::mpsc::{self, SyncSender, Receiver, TrySendError};
 use std::sync::{Mutex, LazyLock};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -40,7 +40,10 @@ pub struct AuditEvent {
 }
 
 /// Channel sender to the dedicated SQLite writer thread.
-static TX: LazyLock<Mutex<Option<Sender<AuditEvent>>>> = LazyLock::new(|| Mutex::new(None));
+static TX: LazyLock<Mutex<Option<SyncSender<AuditEvent>>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Writer thread handle, saved for flush() to wait on.
+static WRITER_HANDLE: LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> = LazyLock::new(|| Mutex::new(None));
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS events (
@@ -110,16 +113,20 @@ pub fn audit_init(db_path: &Path, jsonl_path: &Path) -> Result<(), String> {
     eprintln!("[AUDIT] SQLite: {}", db_path.display());
 
     // Spawn dedicated writer thread
-    let (tx, rx): (Sender<AuditEvent>, Receiver<AuditEvent>) = mpsc::channel();
+    let (tx, rx): (SyncSender<AuditEvent>, Receiver<AuditEvent>) = mpsc::sync_channel(1000);
     let jsonl_path = PathBuf::from(jsonl_path);
 
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         writer_thread(conn, rx, &jsonl_path);
     });
 
     {
         let mut tx_guard = TX.lock().unwrap();
         *tx_guard = Some(tx);
+    }
+    {
+        let mut h_guard = WRITER_HANDLE.lock().unwrap();
+        *h_guard = Some(handle);
     }
 
     Ok(())
@@ -210,18 +217,41 @@ fn writer_thread(conn: Connection, rx: Receiver<AuditEvent>, jsonl_path: &Path) 
 pub fn audit_log(event: &AuditEvent) {
     let tx_guard = TX.lock().unwrap();
     if let Some(sender) = tx_guard.as_ref() {
-        let _ = sender.send(event.clone());
+        match sender.try_send(event.clone()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                static DROPPED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 100 == 0 {
+                    eprintln!("[AUDIT] WARNING: {} events dropped (channel full)", n + 1);
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
     }
 }
 
 /// Flush pending audit events (drop sender to close channel, letting writer drain).
 /// Called during graceful shutdown.
 pub fn flush() {
-    let mut tx_guard = TX.lock().unwrap();
-    // Drop the sender — writer thread will drain remaining events then exit
-    *tx_guard = None;
-    // Give writer thread a moment to flush
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Drop sender to close channel
+    {
+        let mut tx_guard = TX.lock().unwrap();
+        *tx_guard = None;
+    }
+
+    // Wait for writer thread to finish (with 5s timeout)
+    let mut h_guard = WRITER_HANDLE.lock().unwrap();
+    if let Some(handle) = h_guard.take() {
+        let start = std::time::Instant::now();
+        while !handle.is_finished() && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !handle.is_finished() {
+            eprintln!("[AUDIT] WARNING: writer thread did not finish in 5s");
+        }
+    }
 }
 
 /// Delete events older than 7 days or beyond 50000 rows.

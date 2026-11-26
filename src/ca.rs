@@ -7,12 +7,15 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Holds the CA certificate and key in rcgen-compatible form for signing leaf certs.
 pub struct CaCert {
-    /// DER-encoded CA certificate (for rustls + rcgen re-parsing)
+    #[allow(dead_code)]
     pub cert_der: CertificateDer<'static>,
     /// DER-encoded CA private key (for rustls)
+    #[allow(dead_code)]
     pub key_der: PrivateKeyDer<'static>,
     /// rcgen CA key pair (for signing)
     ca_key: KeyPair,
+    /// Cached CA certificate params (avoids re-parsing DER each leaf generation)
+    ca_params: CertificateParams,
 }
 
 impl CaCert {
@@ -49,7 +52,11 @@ impl CaCert {
             .map_err(|e| format!("rcgen key pair: {e}"))?;
 
         eprintln!("[CA] Loaded CA from {} / {}", cert_path.display(), key_path.display());
-        Ok(Self { cert_der, key_der, ca_key })
+
+        let ca_params = CertificateParams::from_ca_cert_der(&cert_der)
+            .map_err(|e| format!("ca params from der: {e}"))?;
+
+        Ok(Self { cert_der, key_der, ca_key, ca_params })
     }
 
     fn generate_and_save(cert_path: &Path, key_path: &Path) -> Result<Self, String> {
@@ -92,21 +99,22 @@ impl CaCert {
         eprintln!("[CA] Generated new CA: {} / {}", cert_path.display(), key_path.display());
 
         let cert_der = cert.der().clone();
+        let ca_params = CertificateParams::from_ca_cert_der(&cert_der)
+            .map_err(|e| format!("ca params from der: {e}"))?;
+
         let key_der = ca_key.serialize_der().try_into()
             .map_err(|e| format!("convert key: {e}"))?;
 
-        Ok(Self { cert_der, key_der, ca_key })
+        Ok(Self { cert_der, key_der, ca_key, ca_params })
     }
 
     /// Generate a leaf certificate for the given hostname, signed by the CA.
     pub fn generate_leaf(&self, hostname: &str) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), String> {
-        // Re-parse CA params from DER (signed_by consumes CertificateParams)
-        let ca_params = CertificateParams::from_ca_cert_der(&self.cert_der)
-            .map_err(|e| format!("ca params from der: {e}"))?;
-
-        // Create a Certificate object from CA params for use as issuer in signed_by
-        let ca_cert = ca_params.self_signed(&self.ca_key)
+        // Use cached CA params (no re-parsing from DER each time)
+        let ca_cert = self.ca_params.clone().self_signed(&self.ca_key)
             .map_err(|e| format!("ca self_signed: {e}"))?;
+
+
 
         // Leaf cert params
         let mut params = CertificateParams::new(vec![hostname.to_string()])

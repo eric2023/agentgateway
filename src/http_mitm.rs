@@ -20,8 +20,12 @@ pub struct UpstreamConnector {
 }
 
 impl UpstreamConnector {
-    pub fn new(_insecure: bool) -> Arc<Self> {
-        let tls_config = crate::tls::Certifier::client_config_insecure();
+    pub fn new(insecure: bool) -> Arc<Self> {
+        let tls_config = if insecure {
+            crate::tls::Certifier::client_config_insecure()
+        } else {
+            crate::tls::Certifier::client_config_secure()
+        };
         Arc::new(Self { tls_config })
     }
 

@@ -100,6 +100,18 @@ impl Certifier {
 
         Arc::new(dangerous_config)
     }
+
+    /// Build a rustls ClientConfig for connecting to upstream with proper cert verification.
+    pub fn client_config_secure() -> Arc<rustls::ClientConfig> {
+        let root_store = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
+        };
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        )
+    }
 }
 
 #[derive(Debug)]
