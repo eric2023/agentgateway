@@ -182,6 +182,13 @@ pub async fn process_http(
         } else {
             stream_response_simple(&mut upstream, client).await?;
         }
+        // Honor Connection: close on the request: break the keep-alive loop so
+        // the connection closes cleanly instead of waiting for a next request
+        // that will never come. Uses the request header string (req_data[..header_len]).
+        let req_header_str = String::from_utf8_lossy(&req_data[..header_len]);
+        if is_connection_close(&req_header_str) {
+            return Ok(());
+        }
 
         // Loop continues — wait for the next request on the same connection (keep-alive).
     }
@@ -287,9 +294,31 @@ async fn stream_http_response(
     client.flush().await?;
 
     // Stream remaining body with 300s idle timeout
-    let mut total_body: u64 = body_start.len() as u64;
+    let is_chunked = is_chunked(&header_str);
     let content_length = parse_content_length(&header_str);
+    let mut total_body: u64 = body_start.len() as u64;
+    // For chunked responses, accumulate body bytes to detect the 0\r\n\r\n terminator.
+    // Content-Length responses just count bytes; connection-close responses pipe to EOF.
+    let mut body_buf = if is_chunked {
+        let mut v = Vec::new();
+        v.extend_from_slice(body_start);
+        v
+    } else {
+        Vec::new()
+    };
     loop {
+        // Check termination BEFORE reading more (handles bodies already complete
+        // in the header buffer, and stops as soon as the terminator is fully read).
+        if is_chunked {
+            if find_chunked_end(&body_buf, 0).is_some() {
+                break;
+            }
+        } else if let Some(cl) = content_length {
+            if total_body >= cl as u64 {
+                break;
+            }
+        }
+
         let n = tokio::time::timeout(
             Duration::from_secs(300),
             upstream.read(&mut tmp),
@@ -302,10 +331,10 @@ async fn stream_http_response(
             let take = std::cmp::min(4096 - body_preview.len(), n);
             body_preview.extend_from_slice(&tmp[..take]);
         }
-        total_body += n as u64;
-        if let Some(cl) = content_length {
-            if total_body >= cl as u64 { break; }
+        if is_chunked {
+            body_buf.extend_from_slice(&tmp[..n]);
         }
+        total_body += n as u64;
     }
 
     // 4. Record audit event
@@ -352,22 +381,85 @@ async fn stream_http_response(
     Ok(())
 }
 
-/// Stream response for non-AI requests: just pipe bytes, no audit.
+/// Stream response for non-AI requests: parse headers, then stream the body
+/// with proper termination (chunked or Content-Length) so the keep-alive loop
+/// can reuse the upstream connection. No audit recording.
 async fn stream_response_simple(
     upstream: &mut tokio_rustls::client::TlsStream<TcpStream>,
     client: &mut TlsStream<TcpStream>,
 ) -> Result<(), BoxError> {
-    let mut tmp = [0u8; 8192];
+    // 1. Read response headers (up to \r\n\r\n), with 60s timeout
+    let mut header_buf = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 4096];
+    let header_end = loop {
+        let n = tokio::time::timeout(
+            Duration::from_secs(60),
+            upstream.read(&mut tmp),
+        ).await
+            .map_err(|_| -> BoxError { "response header read timeout".into() })??;
+        if n == 0 {
+            if !header_buf.is_empty() {
+                client.write_all(&header_buf).await?;
+                client.flush().await?;
+            }
+            return Ok(());
+        }
+        header_buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = find_header_end(&header_buf) {
+            let hdr_end = pos + 4;
+            client.write_all(&header_buf[..hdr_end]).await?;
+            client.flush().await?;
+            break hdr_end;
+        }
+    };
+
+    // 2. Determine body framing
+    let header_str = String::from_utf8_lossy(&header_buf[..header_end - 4]);
+    let is_chunked = is_chunked(&header_str);
+    let content_length = parse_content_length(&header_str);
+
+    // 3. Forward any body bytes that arrived with the headers
+    let body_start = &header_buf[header_end..];
+    if !body_start.is_empty() {
+        client.write_all(body_start).await?;
+        client.flush().await?;
+    }
+    let mut total_body: u64 = body_start.len() as u64;
+    let mut body_buf = if is_chunked {
+        let mut v = Vec::new();
+        v.extend_from_slice(body_start);
+        v
+    } else {
+        Vec::new()
+    };
+
+    // 4. Stream body with 300s idle timeout, terminating on chunked end
+    //    or Content-Length exhaustion (keeps the upstream reusable).
     loop {
+        if is_chunked {
+            if find_chunked_end(&body_buf, 0).is_some() {
+                break;
+            }
+        } else if let Some(cl) = content_length {
+            if total_body >= cl as u64 {
+                break;
+            }
+        }
+
         let n = tokio::time::timeout(
             Duration::from_secs(300),
             upstream.read(&mut tmp),
         ).await
-            .map_err(|_| -> BoxError { "response read timeout".into() })??;
+            .map_err(|_| -> BoxError { "response body read timeout".into() })??;
         if n == 0 { break; }
         client.write_all(&tmp[..n]).await?;
         client.flush().await?;
+        if is_chunked {
+            body_buf.extend_from_slice(&tmp[..n]);
+        }
+        total_body += n as u64;
     }
+
     Ok(())
 }
 
