@@ -109,8 +109,18 @@ if [[ -f "$CA_SRC" ]]; then
     echo "[setup] Installing AgentGateway CA to $CA_DST..."
     cp "$CA_SRC" "$CA_DST"
     chmod 644 "$CA_DST"
-    update-ca-certificates 2>&1 || true
-    echo "[setup] System CA installed"
+    if ! update-ca-certificates 2>&1; then
+        echo "[setup] ERROR: update-ca-certificates failed!" >&2
+        echo "[setup] CA file is at $CA_DST but not in system bundle." >&2
+        echo "[setup] Try manually: sudo update-ca-certificates" >&2
+    fi
+    # Verify CA actually entered the system bundle
+    if grep -q "AgentGateway" /etc/ssl/certs/ca-certificates.crt 2>/dev/null; then
+        echo "[setup] System CA installed and verified in ca-certificates.crt"
+    else
+        echo "[setup] ERROR: CA not found in /etc/ssl/certs/ca-certificates.crt after update!" >&2
+        echo "[setup] Try manually: sudo update-ca-certificates --fresh" >&2
+    fi
 else
     echo "[setup] WARNING: $CA_SRC not found — CA generation failed" >&2
 fi

@@ -71,6 +71,24 @@ stop_proc() {
     rm -f "$pidfile"
 }
 
+# Kill any stale process listening on the proxy port (e.g. orphaned agentgateway
+# whose pidfile was lost or pointed at the wrong PID). Prevents AddrInUse.
+kill_stale_proxy() {
+    local pids
+    pids="$(ss -tlnpH 2>/dev/null | grep ":$PROXY_PORT " | grep -oP 'pid=\K[0-9]+' || true)"
+    if [[ -n "$pids" ]]; then
+        echo "[start.sh] Killing stale process on port $PROXY_PORT (pid=$pids) ..."
+        for p in $pids; do
+            kill "$p" 2>/dev/null || true
+        done
+        sleep 1
+        for p in $pids; do
+            kill -9 "$p" 2>/dev/null || true
+        done
+        sleep 0.5
+    fi
+}
+
 # start_proc accepts a full command string (supports args).
 start_proc() {
     local name="$1" cmd="$2" pidfile="$3" logfile="$4"
@@ -109,6 +127,7 @@ do_stop() {
 do_start() {
     # Stop existing instances first (clean restart).
     do_stop 2>/dev/null || true
+    kill_stale_proxy
 
     # Health checks: verify iptables rule and CA are installed
     if [[ ! -f /usr/local/share/ca-certificates/agentgateway-ca.crt ]]; then
@@ -136,6 +155,7 @@ do_start() {
 do_foreground() {
     # Stop any background instances.
     do_stop 2>/dev/null || true
+    kill_stale_proxy
 
     echo "[start.sh] Starting proxy (foreground) ..."
     bash -c "$(proxy_cmd)" >>"$PROXY_LOG" 2>&1 &
