@@ -21,8 +21,11 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IPTABLES="/usr/sbin/iptables-legacy"
 CGROUP_DIR="/sys/fs/cgroup/net_cls/agentgateway"
-CLASSID="0x100001"
-REDIRECT_PORT=8444
+PROXY_GID=""
+# Try to find the agwproxy group GID (created by setup or manually)
+if getent group agwproxy &>/dev/null; then
+    PROXY_GID="$(getent group agwproxy | cut -d: -f3)"
+fi
 
 # Common HTTPS ports used by AI API endpoints
 HTTPS_PORTS=(443 8443 9443)
@@ -61,7 +64,19 @@ if [[ "${1:-}" == "--cleanup" ]]; then
     fi
     echo "[setup] Removing iptables rules..."
     removed=0
+    # Get PROXY_GID for removing GID-exclusion rules
+    PROXY_GID_CLEANUP=""
+    if getent group agwproxy &>/dev/null; then
+        PROXY_GID_CLEANUP="$(getent group agwproxy | cut -d: -f3)"
+    fi
     for port in "${HTTPS_PORTS[@]}"; do
+        # Remove GID-exclusion RETURN rule
+        if [[ -n "$PROXY_GID_CLEANUP" ]]; then
+            $IPTABLES -t nat -D OUTPUT \
+                -p tcp --dport "$port" -m owner --gid-owner "$PROXY_GID_CLEANUP" \
+                -j RETURN 2>/dev/null && removed=$((removed + 1))
+        fi
+        # Remove REDIRECT rule
         if $IPTABLES -t nat -D OUTPUT \
             -p tcp --dport "$port" -m cgroup --cgroup "$CLASSID" \
             -j REDIRECT --to-port "$REDIRECT_PORT" 2>/dev/null; then
@@ -110,9 +125,12 @@ if [[ -f "$CA_SRC" ]]; then
     cp "$CA_SRC" "$CA_DST"
     chmod 644 "$CA_DST"
     if ! update-ca-certificates 2>&1; then
-        echo "[setup] ERROR: update-ca-certificates failed!" >&2
-        echo "[setup] CA file is at $CA_DST but not in system bundle." >&2
-        echo "[setup] Try manually: sudo update-ca-certificates" >&2
+        echo "[setup] update-ca-certificates failed, retrying with --fresh..." >&2
+        if ! update-ca-certificates --fresh 2>&1; then
+            echo "[setup] ERROR: update-ca-certificates --fresh also failed!" >&2
+            echo "[setup] CA file is at $CA_DST but not in system bundle." >&2
+            echo "[setup] Try manually: sudo update-ca-certificates --fresh" >&2
+        fi
     fi
     # Verify CA actually entered the system bundle
     if grep -q "AgentGateway" /etc/ssl/certs/ca-certificates.crt 2>/dev/null; then
@@ -138,15 +156,38 @@ if command -v certutil &>/dev/null; then
     fi
 fi
 
-# ─── 5. Set iptables rules ─────────────────────────────────────────────────
+# ─── 5. Create agwproxy group for proxy GID exclusion ─────────────────────
+# The proxy process runs under the agwproxy GID so iptables can exclude its
+# outgoing connections from REDIRECT (prevents proxy→self redirect loop).
+if ! getent group agwproxy &>/dev/null; then
+    groupadd -r agwproxy
+    echo "[setup] Created system group 'agwproxy'"
+fi
+PROXY_GID="$(getent group agwproxy | cut -d: -f3)"
+echo "[setup] Proxy GID: $PROXY_GID (agwproxy)"
+
+# ─── 6. Set iptables rules ─────────────────────────────────────────────────
 echo "[setup] Setting iptables-legacy REDIRECT rules for ports: ${HTTPS_PORTS[*]}..."
 
+# First: remove old rules (both old format without GID exclusion and new format)
 for port in "${HTTPS_PORTS[@]}"; do
-    # Remove old rule if exists (ignore errors)
+    # Remove old GID-exclusion RETURN rule
+    $IPTABLES -t nat -D OUTPUT \
+        -p tcp --dport "$port" -m owner --gid-owner "$PROXY_GID" \
+        -j RETURN 2>/dev/null || true
+    # Remove old REDIRECT rule (old format, no GID exclusion)
     $IPTABLES -t nat -D OUTPUT \
         -p tcp --dport "$port" -m cgroup --cgroup "$CLASSID" \
         -j REDIRECT --to-port "$REDIRECT_PORT" 2>/dev/null || true
-    # Add rule
+done
+
+# Add new rules: GID exclusion RETURN first, then REDIRECT for cgroup traffic
+for port in "${HTTPS_PORTS[@]}"; do
+    # Exclude proxy's own outgoing connections (prevents redirect loop)
+    $IPTABLES -t nat -A OUTPUT \
+        -p tcp --dport "$port" -m owner --gid-owner "$PROXY_GID" \
+        -j RETURN
+    # Redirect cgroup traffic to proxy
     $IPTABLES -t nat -A OUTPUT \
         -p tcp --dport "$port" -m cgroup --cgroup "$CLASSID" \
         -j REDIRECT --to-port "$REDIRECT_PORT"

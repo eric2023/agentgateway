@@ -22,7 +22,14 @@ pub async fn handle_connection(
 ) -> Result<(), BoxError> {
     // Get original destination via SO_ORIGINAL_DST
     let orig_dst = get_original_dst(&client)?;
-
+    // Defensive: if orig_dst is our own listen address, the connection was
+    // not properly REDIRECTed (or REDIRECT loop) — drop immediately to
+    // prevent proxy→self infinite loop.
+    if orig_dst.port() == 8444 && orig_dst.ip().is_loopback() {
+        return Err(
+            format!("redirect loop detected: orig_dst={} is self — dropping", orig_dst).into(),
+        );
+    }
     // Peek first bytes to detect TLS ClientHello
     let mut peek_buf = [0u8; 16384]; // TLS record max = 16384 (was 1024, truncated extended ClientHello)
     let n = match tokio::time::timeout(

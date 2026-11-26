@@ -134,13 +134,15 @@ def get_stats():
             WHERE ts_unix > ? AND decision IN ('BLOCK','FORWARD','AUDIT')
         """, (cutoff,)).fetchall()
         timeline = defaultdict(lambda: {"blocked": 0, "forwarded": 0, "audited": 0})
+        decision_map = {"block": "blocked", "forward": "forwarded", "audit": "audited"}
         for r in tl_rows:
             ts = r["ts_unix"]
             if ts:
                 minute = datetime.fromtimestamp(ts, tz=LOCAL_TZ).strftime("%H:%M")
                 decision = (r["decision"] or "").lower()
-                if decision in ("block", "forward", "audit"):
-                    timeline[minute][decision] += 1
+                key = decision_map.get(decision)
+                if key:
+                    timeline[minute][key] += 1
         tl_sorted = [{"minute": k, "blocked": v["blocked"],
                       "forwarded": v["forwarded"], "audited": v["audited"]}
                      for k, v in sorted(timeline.items())]

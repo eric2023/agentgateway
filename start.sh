@@ -107,13 +107,22 @@ start_proc() {
 
 proxy_cmd() {
     # Use release binary if available, fall back to debug
+    local bin
     if [[ -x "$PROXY_BIN" ]]; then
-        echo "ulimit -n 65536; $PROXY_BIN --host 127.0.0.1 --port $PROXY_PORT"
+        bin="$PROXY_BIN"
     elif [[ -x "$PROJECT_DIR/target/debug/agentgateway" ]]; then
-        echo "ulimit -n 65536; $PROJECT_DIR/target/debug/agentgateway --host 127.0.0.1 --port $PROXY_PORT"
+        bin="$PROJECT_DIR/target/debug/agentgateway"
     else
         echo "[start.sh] ERROR: agentgateway binary not found. Build with: cargo build --release" >&2
         exit 1
+    fi
+    # Run under agwproxy GID so iptables --gid-owner exclusion prevents
+    # the proxy's upstream connections from being REDIRECTed back to itself.
+    if getent group agwproxy &>/dev/null; then
+        echo "ulimit -n 65536; sg agwproxy -c '$bin --host 127.0.0.1 --port $PROXY_PORT'"
+    else
+        echo "[start.sh] WARNING: agwproxy group not found, running without GID exclusion" >&2
+        echo "ulimit -n 65536; $bin --host 127.0.0.1 --port $PROXY_PORT"
     fi
 }
 
