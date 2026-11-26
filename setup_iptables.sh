@@ -177,6 +177,12 @@ if ! getent group agwproxy &>/dev/null; then
     groupadd -r agwproxy
     echo "[setup] Created system group 'agwproxy'"
 fi
+# Add the current user to agwproxy group so 'sg agwproxy' works without password
+SETUP_USER="${SUDO_USER:-$(whoami)}"
+if ! id -nG "$SETUP_USER" 2>/dev/null | grep -qw agwproxy; then
+    usermod -aG agwproxy "$SETUP_USER"
+    echo "[setup] Added user '$SETUP_USER' to group 'agwproxy'"
+fi
 PROXY_GID="$(getent group agwproxy | cut -d: -f3)"
 echo "[setup] Proxy GID: $PROXY_GID (agwproxy)"
 
