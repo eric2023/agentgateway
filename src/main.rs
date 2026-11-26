@@ -12,6 +12,22 @@ mod http_mitm;
 
 use clap::Parser;
 use std::path::PathBuf;
+// Raise the file descriptor limit so many simultaneous tunnels don't hit EMFILE.
+fn raise_fd_limit() {
+    use libc::{getrlimit, setrlimit, rlimit, RLIMIT_NOFILE};
+    let mut rl = rlimit { rlim_cur: 0, rlim_max: 0 };
+    unsafe {
+        if getrlimit(RLIMIT_NOFILE, &mut rl) != 0 {
+            return;
+        }
+        let want = rl.rlim_max.min(65536);
+        if want > rl.rlim_cur {
+            rl.rlim_cur = want;
+            let _ = setrlimit(RLIMIT_NOFILE, &rl);
+        }
+    }
+}
+
 use tokio::signal;
 
 /// AgentGateway — transparent MITM proxy for AI request auditing.
@@ -50,6 +66,9 @@ struct Args {
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
+
+    // Raise FD limit — each tunnel uses 2 FDs; 1024 default is too low for browsers.
+    raise_fd_limit();
 
     // Initialize audit DB
     audit::audit_init(&args.audit_db, &args.audit_jsonl)

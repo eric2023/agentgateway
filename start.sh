@@ -90,9 +90,9 @@ start_proc() {
 proxy_cmd() {
     # Use release binary if available, fall back to debug
     if [[ -x "$PROXY_BIN" ]]; then
-        echo "$PROXY_BIN --host 127.0.0.1 --port $PROXY_PORT"
+        echo "ulimit -n 65536; $PROXY_BIN --host 127.0.0.1 --port $PROXY_PORT"
     elif [[ -x "$PROJECT_DIR/target/debug/agentgateway" ]]; then
-        echo "$PROJECT_DIR/target/debug/agentgateway --host 127.0.0.1 --port $PROXY_PORT"
+        echo "ulimit -n 65536; $PROJECT_DIR/target/debug/agentgateway --host 127.0.0.1 --port $PROXY_PORT"
     else
         echo "[start.sh] ERROR: agentgateway binary not found. Build with: cargo build --release" >&2
         exit 1

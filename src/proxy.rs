@@ -186,6 +186,9 @@ fn get_original_dst(sock: &TcpStream) -> Result<SocketAddr, std::io::Error> {
 }
 
 /// Blind TCP tunnel — no inspection, just pipe bytes both ways.
+/// Uses `select!` so that either direction ending (EOF, timeout, or error)
+/// immediately cancels the other and closes both sockets. This prevents
+/// FD leakage from half-open tunnels that linger waiting for the other side.
 async fn blind_tunnel(
     mut client: TcpStream,
     mut upstream: TcpStream,
@@ -221,7 +224,16 @@ async fn blind_tunnel(
         }
     };
 
-    tokio::try_join!(client_to_upstream, upstream_to_client)?;
+    // Either direction ending (EOF, timeout, or error) cancels the other
+    // and closes both sockets immediately — no half-open tunnel leakage.
+    tokio::select! {
+        res = client_to_upstream => {
+            let _ = res;
+        }
+        res = upstream_to_client => {
+            let _ = res;
+        }
+    }
     Ok(())
 }
 
