@@ -2,7 +2,6 @@
 // CA certificate loading / generation via rcgen.
 
 use std::path::Path;
-use std::sync::Arc;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 

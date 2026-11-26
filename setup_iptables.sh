@@ -6,7 +6,7 @@
 #   1. modprobe xt_cgroup
 #   2. Create cgroup net_cls/agentgateway (classid 0x100001)
 #   3. chmod 666 tasks (allow non-root agw-admit to write)
-#   4. Install system-level CA
+#   4. Install system-level CA (certs/ca-cert.pem)
 #   5. Set iptables-legacy REDIRECT rules for common HTTPS ports
 #
 # Usage: sudo bash setup_iptables.sh           # setup
@@ -15,7 +15,7 @@
 set -uo pipefail
 # Fix HOME when invoked via sudo without --preserve-env
 if [[ -n "${SUDO_USER:-}" && "$HOME" == "/root" ]]; then
-    SUDO_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+    SUDO_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -6)"
     [[ -n "$SUDO_HOME" ]] && HOME="$SUDO_HOME"
 fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -43,7 +43,7 @@ Usage: sudo bash setup_iptables.sh [选项]
   1. modprobe xt_cgroup — 加载 cgroup 匹配内核模块
   2. 创建 cgroup /sys/fs/cgroup/net_cls/agentgateway（classid 0x100001）
   3. chmod 666 tasks — 允许普通用户 agw-admit 写入
-  4. 安装 mitmproxy CA 到 /usr/local/share/ca-certificates/agentgateway-ca.crt
+  4. 安装 AgentGateway CA (certs/ca-cert.pem) 到系统 CA
   5. 设置 iptables-legacy REDIRECT 规则（:443 :8443 :9443 → :8444）
 
 验证:  /usr/sbin/iptables-legacy -t nat -L OUTPUT -n
@@ -89,34 +89,43 @@ echo "$CLASSID" > "$CGROUP_DIR/net_cls.classid"
 chmod 666 "$CGROUP_DIR/tasks"
 echo "[setup] cgroup tasks writable by all users"
 
-# ─── 4. Install system-level CA (mitmproxy CA) ─────────────────────────────
-MITM_CA_DIR="$HOME/.mitmproxy"
-MITM_CA_SRC="$MITM_CA_DIR/mitmproxy-ca-cert.pem"
+# ─── 4. Install system-level CA ────────────────────────────────────────────
+CA_SRC="$SCRIPT_DIR/certs/ca-cert.pem"
 CA_DST="/usr/local/share/ca-certificates/agentgateway-ca.crt"
 
-# Generate mitmproxy CA on first run
-if [[ ! -f "$MITM_CA_SRC" ]]; then
-    echo "[setup] Generating mitmproxy CA..."
-    timeout 3 mitmdump --quiet 2>/dev/null || true
+# If CA doesn't exist, generate it by running the Rust binary briefly
+if [[ ! -f "$CA_SRC" ]]; then
+    echo "[setup] CA not found at $CA_SRC, generating via agentgateway..."
+    if [[ -x "$SCRIPT_DIR/target/release/agentgateway" ]]; then
+        timeout 3 "$SCRIPT_DIR/target/release/agentgateway" --port 0 2>/dev/null || true
+    elif [[ -x "$SCRIPT_DIR/target/debug/agentgateway" ]]; then
+        timeout 3 "$SCRIPT_DIR/target/debug/agentgateway" --port 0 2>/dev/null || true
+    else
+        echo "[setup] WARNING: agentgateway binary not found. Build with: cargo build --release" >&2
+    fi
 fi
 
-if [[ -f "$MITM_CA_SRC" ]]; then
-    echo "[setup] Installing mitmproxy CA to $CA_DST..."
-    cp "$MITM_CA_SRC" "$CA_DST"
+if [[ -f "$CA_SRC" ]]; then
+    echo "[setup] Installing AgentGateway CA to $CA_DST..."
+    cp "$CA_SRC" "$CA_DST"
     chmod 644 "$CA_DST"
     update-ca-certificates 2>&1 || true
     echo "[setup] System CA installed"
 else
-    echo "[setup] WARNING: $MITM_CA_SRC not found — mitmproxy CA generation failed"
+    echo "[setup] WARNING: $CA_SRC not found — CA generation failed" >&2
 fi
 
 # Also install to NSS DB for Chrome/Chromium
 if command -v certutil &>/dev/null; then
     NSSDB="$HOME/.pki/nssdb"
     mkdir -p "$NSSDB"
-    certutil -d "sql:$NSSDB" -D -n "AgentGateway Root CA" 2>/dev/null || true
-    certutil -d "sql:$NSSDB" -A -t "C,," -n "mitmproxy" -i "$MITM_CA_SRC" 2>/dev/null || true
-    echo "[setup] NSS DB CA installed"
+    # Remove old mitmproxy nickname if present (migration from old setup)
+    certutil -d "sql:$NSSDB" -D -n "mitmproxy" 2>/dev/null || true
+    certutil -d "sql:$NSSDB" -D -n "agentgateway" 2>/dev/null || true
+    if [[ -f "$CA_SRC" ]]; then
+        certutil -d "sql:$NSSDB" -A -t "C,," -n "agentgateway" -i "$CA_SRC" 2>/dev/null || true
+        echo "[setup] NSS DB CA installed (nickname: agentgateway)"
+    fi
 fi
 
 # ─── 5. Set iptables rules ─────────────────────────────────────────────────

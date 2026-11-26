@@ -5,13 +5,14 @@
 //   2. Scanning /proc/*/fd/ to find which PID owns the socket
 //   3. Walking the parent chain to find the real agent process
 //   4. Reading AGENTGATEWAY_* env vars from /proc/<pid>/environ
+use std::net::IpAddr;
 use std::sync::{Mutex, LazyLock};
 use std::collections::HashSet;
 use std::fs;
 use std::time::{Duration, Instant};
 
 const LISTEN_PORT: u16 = 8444;
-const CACHE_TTL: Duration = Duration::from_secs(30);
+const CACHE_TTL: Duration = Duration::from_secs(5); // reduced from 30s to 5s (C09)
 
 struct CacheEntry {
     agent_pid: Option<i32>,
@@ -21,7 +22,7 @@ struct CacheEntry {
     session_id: Option<String>,
     ts: Instant,
 }
-static CACHE: LazyLock<Mutex<std::collections::HashMap<u16, CacheEntry>>> =
+static CACHE: LazyLock<Mutex<std::collections::HashMap<(u16, IpAddr), CacheEntry>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// Tool processes — not the real agent. Skip these when walking the parent chain.
@@ -35,13 +36,14 @@ const TOOL_PROCESSES: &[&str] = &[
     "supervisord", "systemd", "init",
 ];
 
-/// Look up the peer process for a given client port.
+/// Look up the peer process for a given client connection.
+/// Uses (peer_port, peer_ip) as cache key to reduce port-reuse misattribution (C09).
 /// Returns (agent_pid, agent_comm, app_name, agent_id, session_id).
-pub fn lookup_peer(peer_port: u16) -> (Option<i32>, Option<String>, Option<String>, Option<String>, Option<String>) {
+pub fn lookup_peer(peer_port: u16, peer_ip: IpAddr) -> (Option<i32>, Option<String>, Option<String>, Option<String>, Option<String>) {
     // Check cache
     {
         let cache = CACHE.lock().unwrap();
-        if let Some(entry) = cache.get(&peer_port) {
+        if let Some(entry) = cache.get(&(peer_port, peer_ip)) {
             if entry.ts.elapsed() < CACHE_TTL {
                 return (
                     entry.agent_pid.clone(),
@@ -97,7 +99,7 @@ pub fn lookup_peer(peer_port: u16) -> (Option<i32>, Option<String>, Option<Strin
     // Cache the result
     {
         let mut cache = CACHE.lock().unwrap();
-        cache.insert(peer_port, CacheEntry {
+        cache.insert((peer_port, peer_ip), CacheEntry {
             agent_pid,
             agent_comm: agent_comm.clone(),
             app_name: app_name.clone(),

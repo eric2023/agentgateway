@@ -50,7 +50,7 @@ const AI_HOST_PATTERNS: &[&str] = &[
 /// Detect if an HTTP request is an AI model API call.
 /// Returns (is_ai, confidence, signals, detail_json).
 pub fn detect_ai_request(
-    method: &str,
+    _method: &str,
     path: &str,
     headers: &[(String, String)],
     body: &[u8],

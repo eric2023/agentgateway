@@ -1,27 +1,59 @@
 // SPDX-License-Identifier: Apache-2.0
 // TLS MITM: dynamic certificate generation using CA + rustls.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use rustls::server::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use crate::ca::CaCert;
+
+const CACHE_MAX: usize = 1000;
 
 struct TlsCert {
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
 }
 
+/// Simple FIFO-eviction cert cache (re-generated on eviction is cheap).
+struct CertCache {
+    map: HashMap<String, Arc<TlsCert>>,
+    order: VecDeque<String>,
+}
+
+impl CertCache {
+    fn new() -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new() }
+    }
+
+    fn get(&self, key: &str) -> Option<Arc<TlsCert>> {
+        self.map.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: String, val: Arc<TlsCert>) {
+        if self.map.contains_key(&key) {
+            return; // already cached
+        }
+        if self.map.len() >= CACHE_MAX {
+            // Evict oldest entry (FIFO)
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, val);
+    }
+}
+
 pub struct Certifier {
     ca: Arc<CaCert>,
-    cache: RwLock<HashMap<String, Arc<TlsCert>>>,
+    cache: RwLock<CertCache>,
 }
 
 impl Certifier {
     pub fn new(ca: CaCert) -> Self {
         Self {
             ca: Arc::new(ca),
-            cache: RwLock::new(HashMap::new()),
+            cache: RwLock::new(CertCache::new()),
         }
     }
 
@@ -31,7 +63,7 @@ impl Certifier {
         {
             let cache = self.cache.read().unwrap();
             if let Some(c) = cache.get(hostname) {
-                return Ok(c.clone());
+                return Ok(c);
             }
         }
 

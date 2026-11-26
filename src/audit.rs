@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Audit logging — SQLite WAL + JSONL dual-write.
-// Ported from agentgatewayd.py audit_log() with the same schema.
+// Uses a dedicated writer thread (mpsc channel) to avoid blocking the async runtime (C04).
 
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Sender, Receiver};
+use std::sync::{Mutex, LazyLock};
 use rusqlite::Connection;
 use serde_json::Value;
 
 const MAX_BODY_SIZE: usize = 64 * 1024; // 64KB
 
+#[derive(Clone)]
 pub struct AuditEvent {
     pub event: String,
     pub decision: String,
@@ -37,8 +39,8 @@ pub struct AuditEvent {
     pub source: String,
 }
 
-static DB: Mutex<Option<Connection>> = Mutex::new(None);
-static JSONL_PATH: Mutex<Option<String>> = Mutex::new(None);
+/// Channel sender to the dedicated SQLite writer thread.
+static TX: LazyLock<Mutex<Option<Sender<AuditEvent>>>> = LazyLock::new(|| Mutex::new(None));
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS events (
@@ -77,7 +79,7 @@ CREATE INDEX IF NOT EXISTS idx_agent  ON events(agent_id);
 CREATE INDEX IF NOT EXISTS idx_event  ON events(event);
 ";
 
-/// Initialize the audit database and JSONL backup file.
+/// Initialize the audit database, JSONL backup file, and writer thread.
 pub fn audit_init(db_path: &Path, jsonl_path: &Path) -> Result<(), String> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
@@ -107,70 +109,64 @@ pub fn audit_init(db_path: &Path, jsonl_path: &Path) -> Result<(), String> {
 
     eprintln!("[AUDIT] SQLite: {}", db_path.display());
 
+    // Spawn dedicated writer thread
+    let (tx, rx): (Sender<AuditEvent>, Receiver<AuditEvent>) = mpsc::channel();
+    let jsonl_path = PathBuf::from(jsonl_path);
+
+    std::thread::spawn(move || {
+        writer_thread(conn, rx, &jsonl_path);
+    });
+
     {
-        let mut db = DB.lock().unwrap();
-        *db = Some(conn);
-    }
-    {
-        let mut jp = JSONL_PATH.lock().unwrap();
-        *jp = Some(jsonl_path.to_string_lossy().to_string());
+        let mut tx_guard = TX.lock().unwrap();
+        *tx_guard = Some(tx);
     }
 
     Ok(())
 }
 
-/// Write an audit event to SQLite + JSONL.
-pub fn audit_log(event: &AuditEvent) {
-    let now = chrono_iso();
-    let ts_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64();
+/// Dedicated writer thread: receives events via channel, writes to SQLite + JSONL.
+fn writer_thread(conn: Connection, rx: Receiver<AuditEvent>, jsonl_path: &Path) {
+    for event in rx {
+        let now = chrono_iso();
+        let ts_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
 
-    let signals_json = serde_json::to_string(&event.signals).unwrap_or_default();
-    let req_headers = event.request_headers.as_ref()
-        .map(|v| truncate_json(v));
-    let req_body = event.request_body.as_ref()
-        .map(|v| truncate_json(v));
-    let resp_headers = event.response_headers.as_ref()
-        .map(|v| truncate_json(v));
-    let resp_body = event.response_body.as_ref()
-        .map(|v| truncate_json(v));
-    let token_usage = event.token_usage.as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_default());
+        let signals_json = serde_json::to_string(&event.signals).unwrap_or_default();
+        let req_headers = event.request_headers.as_ref().map(|v| truncate_json(v));
+        let req_body = event.request_body.as_ref().map(|v| truncate_json(v));
+        let resp_headers = event.response_headers.as_ref().map(|v| truncate_json(v));
+        let resp_body = event.response_body.as_ref().map(|v| truncate_json(v));
+        let token_usage = event.token_usage.as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
 
-    // SQLite insert
-    {
-        let mut db_guard = DB.lock().unwrap();
-        if let Some(conn) = db_guard.as_ref() {
-            let _ = conn.execute(
-                "INSERT INTO events (
-                    ts, ts_unix, event, decision, request_id, agent_id, session_id,
-                    app_name, method, host, port, path, model, confidence, signals,
-                    preview, prompt_len, stream_mode, request_headers, request_body,
-                    response_status, response_headers, response_body,
-                    token_usage, latency_ms, summary, source
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                rusqlite::params![
-                    &now, ts_unix, &event.event, &event.decision,
-                    &event.request_id, &event.agent_id, &event.session_id,
-                    &event.app_name, &event.method, &event.host, event.port,
-                    &event.path, &event.model, event.confidence, &signals_json,
-                    &event.preview, event.prompt_len,
-                    if event.stream_mode { 1 } else { 0 },
-                    req_headers.as_deref(), req_body.as_deref(),
-                    event.response_status,
-                    resp_headers.as_deref(), resp_body.as_deref(),
-                    token_usage.as_deref(), event.latency_ms,
-                    &event.summary, &event.source,
-                ],
-            );
-        }
-    }
+        // SQLite insert
+        let _ = conn.execute(
+            "INSERT INTO events (
+                ts, ts_unix, event, decision, request_id, agent_id, session_id,
+                app_name, method, host, port, path, model, confidence, signals,
+                preview, prompt_len, stream_mode, request_headers, request_body,
+                response_status, response_headers, response_body,
+                token_usage, latency_ms, summary, source
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rusqlite::params![
+                &now, ts_unix, &event.event, &event.decision,
+                &event.request_id, &event.agent_id, &event.session_id,
+                &event.app_name, &event.method, &event.host, event.port,
+                &event.path, &event.model, event.confidence, &signals_json,
+                &event.preview, event.prompt_len,
+                if event.stream_mode { 1 } else { 0 },
+                req_headers.as_deref(), req_body.as_deref(),
+                event.response_status,
+                resp_headers.as_deref(), resp_body.as_deref(),
+                token_usage.as_deref(), event.latency_ms,
+                &event.summary, &event.source,
+            ],
+        );
 
-    // JSONL backup
-    let jp = JSONL_PATH.lock().unwrap();
-    if let Some(path) = jp.as_ref() {
+        // JSONL backup
         let json_obj = serde_json::json!({
             "ts": now,
             "ts_unix": ts_unix,
@@ -205,9 +201,27 @@ pub fn audit_log(event: &AuditEvent) {
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
+            .open(jsonl_path)
             .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
     }
+}
+
+/// Write an audit event to the writer thread via channel (non-blocking).
+pub fn audit_log(event: &AuditEvent) {
+    let tx_guard = TX.lock().unwrap();
+    if let Some(sender) = tx_guard.as_ref() {
+        let _ = sender.send(event.clone());
+    }
+}
+
+/// Flush pending audit events (drop sender to close channel, letting writer drain).
+/// Called during graceful shutdown.
+pub fn flush() {
+    let mut tx_guard = TX.lock().unwrap();
+    // Drop the sender — writer thread will drain remaining events then exit
+    *tx_guard = None;
+    // Give writer thread a moment to flush
+    std::thread::sleep(std::time::Duration::from_millis(500));
 }
 
 /// Delete events older than 7 days or beyond 50000 rows.
@@ -226,13 +240,18 @@ pub fn cleanup_old_events(db_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Truncate a JSON value to MAX_BODY_SIZE, respecting UTF-8 character boundaries (C18).
 fn truncate_json(v: &Value) -> String {
     let s = serde_json::to_string(v).unwrap_or_default();
-    if s.len() > MAX_BODY_SIZE {
-        s[..MAX_BODY_SIZE].to_string()
-    } else {
-        s
+    if s.len() <= MAX_BODY_SIZE {
+        return s;
     }
+    // Find the largest valid UTF-8 boundary <= MAX_BODY_SIZE
+    let mut end = MAX_BODY_SIZE;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
 }
 
 fn chrono_iso() -> String {

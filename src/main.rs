@@ -12,6 +12,7 @@ mod http_mitm;
 
 use clap::Parser;
 use std::path::PathBuf;
+use tokio::signal;
 
 /// AgentGateway — transparent MITM proxy for AI request auditing.
 #[derive(Parser, Debug)]
@@ -70,7 +71,7 @@ async fn main() -> std::io::Result<()> {
     ).await?;
 
     eprintln!("═══════════════════════════════════════════════════");
-    eprintln!("AgentGateway (Rust) v0.1.0");
+    eprintln!("AgentGateway (Rust) v0.2.0");
     eprintln!("  Proxy:     {}:{}", args.host, args.port);
     eprintln!("  CA cert:   {}", args.ca_cert.display());
     eprintln!("  Audit DB:  {}", args.audit_db.display());
@@ -87,19 +88,46 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
-    loop {
-        let (client_conn, peer_addr) = listener.accept().await?;
-        let certifier = certifier.clone();
-        let connector = connector.clone();
+    // Spawn the accept loop in a task so we can intercept signals
+    let server_handle = tokio::spawn(async move {
+        loop {
+            let (client_conn, peer_addr) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[ERROR] accept: {}", e);
+                    continue;
+                }
+            };
+            let certifier = certifier.clone();
+            let connector = connector.clone();
 
-        tokio::spawn(async move {
-            if let Err(e) = proxy::handle_connection(
-                client_conn, peer_addr, certifier, connector,
-            ).await {
-                eprintln!("[ERROR] connection from {}: {}", peer_addr, e);
-            }
-        });
-    }
+            tokio::spawn(async move {
+                if let Err(e) = proxy::handle_connection(
+                    client_conn, peer_addr, certifier, connector,
+                ).await {
+                    eprintln!("[ERROR] connection from {}: {}", peer_addr, e);
+                }
+            });
+        }
+    });
+
+    // Wait for SIGTERM or SIGINT for graceful shutdown (C19)
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    let sig = tokio::select! {
+        _ = signal::ctrl_c() => "SIGINT",
+        _ = sigterm.recv() => "SIGTERM",
+    };
+
+    eprintln!("[SHUTDOWN] Received {}, shutting down...", sig);
+
+    // Stop accepting new connections
+    server_handle.abort();
+
+    // Flush pending audit events to SQLite
+    audit::flush();
+
+    eprintln!("[SHUTDOWN] Done.");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -143,9 +171,12 @@ mod tests {
         let tmp_jsonl = std::env::temp_dir().join("test_agw_audit.jsonl");
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&tmp_jsonl);
-        
+        // Clean up WAL/SHM files
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+
         audit::audit_init(&tmp, &tmp_jsonl).unwrap();
-        
+
         let event = audit::AuditEvent {
             event: "ai_request_audited".to_string(),
             decision: "AUDIT".to_string(),
@@ -173,9 +204,12 @@ mod tests {
             summary: "test".to_string(),
             source: "test".to_string(),
         };
-        
+
         audit::audit_log(&event);
-        
+
+        // Give the writer thread a moment to process
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
         // Verify via SQLite
         let conn = rusqlite::Connection::open(&tmp).unwrap();
         let count: i64 = conn.query_row(
@@ -183,15 +217,19 @@ mod tests {
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(count, 1);
-        
+
         let model: String = conn.query_row(
             "SELECT model FROM events WHERE request_id = 'req-test123'",
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(model, "gpt-4");
-        
+
+        // Flush and cleanup
+        audit::flush();
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&tmp_jsonl);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
         println!("test_audit_log passed!");
     }
 
@@ -199,11 +237,59 @@ mod tests {
     fn test_attribution_lookup() {
         // This test verifies the attribution module doesn't crash
         // with an invalid port (should return all None)
-        let (pid, comm, app, agent, session) = attribution::lookup_peer(65535);
+        let (pid, comm, app, agent, session) =
+            attribution::lookup_peer(65535, std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
         assert!(pid.is_none());
         assert!(comm.is_none());
         assert!(app.is_none());
         assert!(agent.is_none());
         assert!(session.is_none());
+    }
+
+    #[test]
+    fn test_extract_sni() {
+        // Test SNI extraction from a minimal TLS ClientHello
+        // Build a minimal ClientHello with SNI = "example.com"
+        let hostname = b"example.com";
+        let mut sni_ext = Vec::new();
+        // Extension type: 0x0000 (SNI)
+        sni_ext.extend_from_slice(&0x0000u16.to_be_bytes());
+        let ext_data_len = (5 + hostname.len()) as u16; // list_len(2) + type(1) + name_len(2) + name
+        sni_ext.extend_from_slice(&ext_data_len.to_be_bytes());
+        let list_len = (3 + hostname.len()) as u16; // type(1) + name_len(2) + name
+        sni_ext.extend_from_slice(&list_len.to_be_bytes());
+        sni_ext.push(0x00); // host_name type
+        sni_ext.extend_from_slice(&(hostname.len() as u16).to_be_bytes());
+        sni_ext.extend_from_slice(hostname);
+
+        // Build ClientHello body
+        let mut hello = Vec::new();
+        hello.extend_from_slice(&[0x03, 0x03]); // version TLS 1.2
+        hello.extend_from_slice(&[0u8; 32]); // random
+        hello.push(0); // session_id_len = 0
+        hello.extend_from_slice(&[0x00, 0x02, 0x00, 0xff]); // cipher_suites_len=2 + one suite
+        hello.push(1); // compression_len=1
+        hello.push(0x00); // null compression
+        hello.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes()); // extensions_len
+        hello.extend_from_slice(&sni_ext);
+
+        // Build handshake header
+        let mut hs = Vec::new();
+        hs.push(0x01); // ClientHello
+        let hl = hello.len();
+        hs.push((hl >> 16) as u8);
+        hs.push((hl >> 8) as u8);
+        hs.push(hl as u8);
+        hs.extend_from_slice(&hello);
+
+        // Build TLS record
+        let mut record = Vec::new();
+        record.push(0x16); // Handshake
+        record.extend_from_slice(&[0x03, 0x01]); // TLS 1.0
+        record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hs);
+
+        let sni = proxy::extract_sni(&record);
+        assert_eq!(sni.as_deref(), Some("example.com"));
     }
 }

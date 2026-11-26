@@ -31,6 +31,18 @@ mkdir -p "$LOG_DIR"
 
 # ─── helpers ────────────────────────────────────────────────────────────────
 
+# Wait for a TCP port to become connectable (replaces fixed sleep, C20)
+wait_for_port() {
+    local port=$1 timeout=$2
+    for _ in $(seq 1 "$timeout"); do
+        if timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
 is_running() {
     local pidfile="$1"
     [[ -f "$pidfile" ]] || return 1
@@ -107,7 +119,8 @@ do_start() {
     fi
 
     start_proc "proxy" "$(proxy_cmd)" "$PROXY_PIDFILE" "$PROXY_LOG"
-    sleep 0.5   # let proxy bind the port before dashboard
+    # Wait for proxy port to be ready (replaces fixed sleep, C20)
+    wait_for_port "$PROXY_PORT" 50 || echo "[start.sh] WARNING: proxy port not ready yet"
     start_proc "dashboard" "$PYTHON $DASHBOARD" "$DASHBOARD_PIDFILE" "$DASHBOARD_LOG"
 
     echo
