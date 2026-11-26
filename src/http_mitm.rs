@@ -245,7 +245,8 @@ async fn stream_http_response(
         }
         header_buf.extend_from_slice(&tmp[..n]);
         if let Some(pos) = find_header_end(&header_buf) {
-            client.write_all(&header_buf).await?;
+            let hdr_end = pos + 4;
+            client.write_all(&header_buf[..hdr_end]).await?;
             client.flush().await?;
             break pos + 4;
         }
