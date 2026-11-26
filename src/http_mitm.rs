@@ -365,8 +365,7 @@ async fn stream_http_response(
             None
         };
     let token_usage = resp_body_json.as_ref()
-        .and_then(|j| j.get("usage"))
-        .map(|u| u.clone());
+        .and_then(|j| j.get("usage")).cloned();
 
     let event = AuditEvent {
         event: "ai_response".to_string(),
@@ -533,7 +532,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 fn parse_content_length(header_str: &str) -> Option<usize> {
     for line in header_str.lines() {
         if line.to_lowercase().starts_with("content-length:") {
-            let val = line.splitn(2, ':').nth(1)?;
+            let val = line.split_once(':')?.1;
             return val.trim().parse().ok();
         }
     }
@@ -551,7 +550,7 @@ fn is_connection_close(header_str: &str) -> bool {
     header_str.lines().any(|line| {
         let l = line.to_lowercase();
         l.starts_with("connection:")
-            && l.splitn(2, ':').nth(1)
+            && l.split_once(':').map(|x| x.1)
                 .map(|v| v.split(',').any(|t| t.trim() == "close"))
                 .unwrap_or(false)
     })
@@ -588,9 +587,11 @@ fn find_chunked_end(buf: &[u8], start: usize) -> Option<usize> {
     }
 }
 
+type RequestHead = (String, String, Vec<(String, String)>, usize);
+
 /// Parse the request head (method, path, headers) from raw bytes.
 /// Returns (method, path, headers, header_len_including_blank_line).
-fn parse_request_head(data: &[u8]) -> Option<(String, String, Vec<(String, String)>, usize)> {
+fn parse_request_head(data: &[u8]) -> Option<RequestHead> {
     let pos = find_header_end(data)?;
     let header_str = String::from_utf8_lossy(&data[..pos]);
     let mut lines = header_str.lines();
@@ -615,9 +616,11 @@ fn parse_request_head(data: &[u8]) -> Option<(String, String, Vec<(String, Strin
     Some((method, path, headers, pos + 4))
 }
 
+type ResponseHead = (u16, Vec<(String, String)>, Vec<u8>);
+
 /// Parse the response head from raw bytes.
 /// Returns (status_code, headers, body).
-fn parse_response_head(data: &[u8]) -> Option<(u16, Vec<(String, String)>, Vec<u8>)> {
+fn parse_response_head(data: &[u8]) -> Option<ResponseHead> {
     let pos = find_header_end(data)?;
     let header_str = String::from_utf8_lossy(&data[..pos]);
     let mut lines = header_str.lines();

@@ -2,6 +2,7 @@
 // CA certificate loading / generation via rcgen.
 
 use std::path::Path;
+use std::sync::Mutex;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -14,8 +15,8 @@ pub struct CaCert {
     pub key_der: PrivateKeyDer<'static>,
     /// rcgen CA key pair (for signing)
     ca_key: KeyPair,
-    /// Cached CA certificate params (avoids re-parsing DER each leaf generation)
-    ca_params: CertificateParams,
+    /// Cached CA certificate (avoids re-self_signed per leaf generation, R5-2)
+    ca_cert: Mutex<rcgen::Certificate>,
 }
 
 impl CaCert {
@@ -55,8 +56,10 @@ impl CaCert {
 
         let ca_params = CertificateParams::from_ca_cert_der(&cert_der)
             .map_err(|e| format!("ca params from der: {e}"))?;
+        let ca_cert = ca_params.self_signed(&ca_key)
+            .map_err(|e| format!("ca self_signed: {e}"))?;
 
-        Ok(Self { cert_der, key_der, ca_key, ca_params })
+        Ok(Self { cert_der, key_der, ca_key, ca_cert: Mutex::new(ca_cert) })
     }
 
     fn generate_and_save(cert_path: &Path, key_path: &Path) -> Result<Self, String> {
@@ -99,22 +102,17 @@ impl CaCert {
         eprintln!("[CA] Generated new CA: {} / {}", cert_path.display(), key_path.display());
 
         let cert_der = cert.der().clone();
-        let ca_params = CertificateParams::from_ca_cert_der(&cert_der)
-            .map_err(|e| format!("ca params from der: {e}"))?;
-
         let key_der = ca_key.serialize_der().try_into()
             .map_err(|e| format!("convert key: {e}"))?;
 
-        Ok(Self { cert_der, key_der, ca_key, ca_params })
+        Ok(Self { cert_der, key_der, ca_key, ca_cert: Mutex::new(cert) })
     }
 
     /// Generate a leaf certificate for the given hostname, signed by the CA.
     pub fn generate_leaf(&self, hostname: &str) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), String> {
-        // Use cached CA params (no re-parsing from DER each time)
-        let ca_cert = self.ca_params.clone().self_signed(&self.ca_key)
-            .map_err(|e| format!("ca self_signed: {e}"))?;
-
-
+        // Use cached CA certificate (no re-self_signed per leaf, R5-2)
+        let ca_cert = self.ca_cert.lock()
+            .map_err(|e| format!("ca cert lock: {e}"))?;
 
         // Leaf cert params
         let mut params = CertificateParams::new(vec![hostname.to_string()])

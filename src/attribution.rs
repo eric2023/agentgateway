@@ -39,14 +39,19 @@ const TOOL_PROCESSES: &[&str] = &[
 /// Look up the peer process for a given client connection.
 /// Uses (peer_port, peer_ip) as cache key to reduce port-reuse misattribution (C09).
 /// Returns (agent_pid, agent_comm, app_name, agent_id, session_id).
-pub fn lookup_peer(peer_port: u16, peer_ip: IpAddr) -> (Option<i32>, Option<String>, Option<String>, Option<String>, Option<String>) {
+pub type PeerInfo = (Option<i32>, Option<String>, Option<String>, Option<String>, Option<String>);
+
+/// Look up the peer process for a given client connection.
+/// Uses (peer_port, peer_ip) as cache key to reduce port-reuse misattribution (C09).
+/// Returns (agent_pid, agent_comm, app_name, agent_id, session_id).
+pub fn lookup_peer(peer_port: u16, peer_ip: IpAddr) -> PeerInfo {
     // Check cache
     {
         let cache = CACHE.lock().unwrap();
         if let Some(entry) = cache.get(&(peer_port, peer_ip)) {
             if entry.ts.elapsed() < CACHE_TTL {
                 return (
-                    entry.agent_pid.clone(),
+                    entry.agent_pid,
                     entry.agent_comm.clone(),
                     entry.app_name.clone(),
                     entry.agent_id.clone(),

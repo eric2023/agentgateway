@@ -2,6 +2,7 @@
 // Audit logging — SQLite WAL + JSONL dual-write.
 // Uses a dedicated writer thread (mpsc channel) to avoid blocking the async runtime (C04).
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, SyncSender, Receiver, TrySendError};
 use std::sync::{Mutex, LazyLock};
@@ -134,6 +135,14 @@ pub fn audit_init(db_path: &Path, jsonl_path: &Path) -> Result<(), String> {
 
 /// Dedicated writer thread: receives events via channel, writes to SQLite + JSONL.
 fn writer_thread(conn: Connection, rx: Receiver<AuditEvent>, jsonl_path: &Path) {
+    // Open JSONL file once and keep a BufWriter for the lifetime of the thread.
+    let mut jsonl = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(jsonl_path)
+        .map(std::io::BufWriter::new)
+        .ok();
+
     for event in rx {
         let now = chrono_iso();
         let ts_unix = std::time::SystemTime::now()
@@ -142,10 +151,10 @@ fn writer_thread(conn: Connection, rx: Receiver<AuditEvent>, jsonl_path: &Path) 
             .as_secs_f64();
 
         let signals_json = serde_json::to_string(&event.signals).unwrap_or_default();
-        let req_headers = event.request_headers.as_ref().map(|v| truncate_json(v));
-        let req_body = event.request_body.as_ref().map(|v| truncate_json(v));
-        let resp_headers = event.response_headers.as_ref().map(|v| truncate_json(v));
-        let resp_body = event.response_body.as_ref().map(|v| truncate_json(v));
+        let req_headers = event.request_headers.as_ref().map(truncate_json);
+        let req_body = event.request_body.as_ref().map(truncate_json);
+        let resp_headers = event.response_headers.as_ref().map(truncate_json);
+        let resp_body = event.response_body.as_ref().map(truncate_json);
         let token_usage = event.token_usage.as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_default());
 
@@ -174,42 +183,44 @@ fn writer_thread(conn: Connection, rx: Receiver<AuditEvent>, jsonl_path: &Path) 
         );
 
         // JSONL backup
-        let json_obj = serde_json::json!({
-            "ts": now,
-            "ts_unix": ts_unix,
-            "event": event.event,
-            "decision": event.decision,
-            "request_id": event.request_id,
-            "agent_id": event.agent_id,
-            "session_id": event.session_id,
-            "app_name": event.app_name,
-            "method": event.method,
-            "host": event.host,
-            "port": event.port,
-            "path": event.path,
-            "model": event.model,
-            "confidence": event.confidence,
-            "signals": event.signals,
-            "preview": event.preview,
-            "prompt_len": event.prompt_len,
-            "stream_mode": event.stream_mode,
-            "request_headers": event.request_headers,
-            "request_body": event.request_body,
-            "response_status": event.response_status,
-            "response_headers": event.response_headers,
-            "response_body": event.response_body,
-            "token_usage": event.token_usage,
-            "latency_ms": event.latency_ms,
-            "summary": event.summary,
-            "source": event.source,
-        });
-        let line = serde_json::to_string(&json_obj).unwrap_or_default();
-        let line = format!("{}\n", line);
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(jsonl_path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+        if let Some(writer) = &mut jsonl {
+            let json_obj = serde_json::json!({
+                "ts": now,
+                "ts_unix": ts_unix,
+                "event": event.event,
+                "decision": event.decision,
+                "request_id": event.request_id,
+                "agent_id": event.agent_id,
+                "session_id": event.session_id,
+                "app_name": event.app_name,
+                "method": event.method,
+                "host": event.host,
+                "port": event.port,
+                "path": event.path,
+                "model": event.model,
+                "confidence": event.confidence,
+                "signals": event.signals,
+                "preview": event.preview,
+                "prompt_len": event.prompt_len,
+                "stream_mode": event.stream_mode,
+                "request_headers": event.request_headers,
+                "request_body": event.request_body,
+                "response_status": event.response_status,
+                "response_headers": event.response_headers,
+                "response_body": event.response_body,
+                "token_usage": event.token_usage,
+                "latency_ms": event.latency_ms,
+                "summary": event.summary,
+                "source": event.source,
+            });
+            let line = serde_json::to_string(&json_obj).unwrap_or_default();
+            let _ = writeln!(writer, "{}", line);
+        }
+    }
+
+    // Flush remaining buffered JSONL data on shutdown
+    if let Some(mut writer) = jsonl {
+        let _ = writer.flush();
     }
 }
 

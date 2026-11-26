@@ -43,7 +43,7 @@ pub async fn handle_connection(
 
         // Only MITM AI hosts; blind-tunnel everything else
         let should_mitm = sni.as_deref()
-            .map(|h| detect::should_mitm_host(h))
+            .map(detect::should_mitm_host)
             .unwrap_or(false);
 
         if should_mitm {
