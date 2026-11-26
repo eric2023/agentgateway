@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Audit logging — SQLite WAL + JSONL dual-write.
+// Audit logging — SQLite WAL only (JSONL removed).
 // Uses a dedicated writer thread (mpsc channel) to avoid blocking the async runtime (C04).
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{self, SyncSender, Receiver, TrySendError};
 use std::sync::{Mutex, LazyLock};
 use rusqlite::Connection;
@@ -83,12 +82,9 @@ CREATE INDEX IF NOT EXISTS idx_agent  ON events(agent_id);
 CREATE INDEX IF NOT EXISTS idx_event  ON events(event);
 ";
 
-/// Initialize the audit database, JSONL backup file, and writer thread.
-pub fn audit_init(db_path: &Path, jsonl_path: &Path) -> Result<(), String> {
+/// Initialize the audit database and writer thread (SQLite only, no JSONL).
+pub fn audit_init(db_path: &Path, _jsonl_path: &Path) -> Result<(), String> {
     if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
-    }
-    if let Some(parent) = jsonl_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
     }
 
@@ -115,10 +111,9 @@ pub fn audit_init(db_path: &Path, jsonl_path: &Path) -> Result<(), String> {
 
     // Spawn dedicated writer thread
     let (tx, rx): (SyncSender<AuditEvent>, Receiver<AuditEvent>) = mpsc::sync_channel(1000);
-    let jsonl_path = PathBuf::from(jsonl_path);
 
     let handle = std::thread::spawn(move || {
-        writer_thread(conn, rx, &jsonl_path);
+        writer_thread(conn, rx);
     });
 
     {
@@ -133,16 +128,8 @@ pub fn audit_init(db_path: &Path, jsonl_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Dedicated writer thread: receives events via channel, writes to SQLite + JSONL.
-fn writer_thread(conn: Connection, rx: Receiver<AuditEvent>, jsonl_path: &Path) {
-    // Open JSONL file once and keep a BufWriter for the lifetime of the thread.
-    let mut jsonl = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(jsonl_path)
-        .map(std::io::BufWriter::new)
-        .ok();
-
+/// Dedicated writer thread: receives events via channel, writes to SQLite.
+fn writer_thread(conn: Connection, rx: Receiver<AuditEvent>) {
     for event in rx {
         let now = chrono_iso();
         let ts_unix = std::time::SystemTime::now()
@@ -181,46 +168,6 @@ fn writer_thread(conn: Connection, rx: Receiver<AuditEvent>, jsonl_path: &Path) 
                 &event.summary, &event.source,
             ],
         );
-
-        // JSONL backup
-        if let Some(writer) = &mut jsonl {
-            let json_obj = serde_json::json!({
-                "ts": now,
-                "ts_unix": ts_unix,
-                "event": event.event,
-                "decision": event.decision,
-                "request_id": event.request_id,
-                "agent_id": event.agent_id,
-                "session_id": event.session_id,
-                "app_name": event.app_name,
-                "method": event.method,
-                "host": event.host,
-                "port": event.port,
-                "path": event.path,
-                "model": event.model,
-                "confidence": event.confidence,
-                "signals": event.signals,
-                "preview": event.preview,
-                "prompt_len": event.prompt_len,
-                "stream_mode": event.stream_mode,
-                "request_headers": event.request_headers,
-                "request_body": event.request_body,
-                "response_status": event.response_status,
-                "response_headers": event.response_headers,
-                "response_body": event.response_body,
-                "token_usage": event.token_usage,
-                "latency_ms": event.latency_ms,
-                "summary": event.summary,
-                "source": event.source,
-            });
-            let line = serde_json::to_string(&json_obj).unwrap_or_default();
-            let _ = writeln!(writer, "{}", line);
-        }
-    }
-
-    // Flush remaining buffered JSONL data on shutdown
-    if let Some(mut writer) = jsonl {
-        let _ = writer.flush();
     }
 }
 

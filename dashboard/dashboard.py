@@ -243,8 +243,16 @@ def get_ai_requests(limit=200):
     db = get_db()
     try:
         rows = db.execute("""
-            SELECT r.*, resp.response_status, resp.response_headers,
-                   resp.response_body, resp.token_usage, resp.latency_ms
+            SELECT r.id, r.ts, r.ts_unix, r.event, r.decision, r.request_id,
+                   r.agent_id, r.session_id, r.app_name, r.method, r.host,
+                   r.port, r.path, r.model, r.confidence, r.signals,
+                   r.preview, r.prompt_len, r.stream_mode, r.request_headers,
+                   r.request_body,
+                   resp.response_status AS resp_status,
+                   resp.response_headers AS resp_headers,
+                   resp.response_body AS resp_body,
+                   resp.token_usage AS resp_token_usage,
+                   resp.latency_ms AS resp_latency_ms
             FROM events r
             LEFT JOIN events resp ON r.request_id = resp.request_id
                 AND resp.event = 'ai_response'
@@ -256,11 +264,10 @@ def get_ai_requests(limit=200):
         result = []
         for row in rows:
             req = _row_to_event(row)
-            # Response fields come from the JOIN alias — extract from row directly
-            resp_body = _parse_json(row["response_body"]) if row["response_body"] else None
-            resp_headers = _parse_json(row["response_headers"]) if row["response_headers"] else {}
-            token_usage = _parse_json(row["token_usage"]) if row["token_usage"] else {}
-            has_resp = row["response_status"] is not None
+            resp_body = _parse_json(row["resp_body"]) if row["resp_body"] else None
+            resp_headers = _parse_json(row["resp_headers"]) if row["resp_headers"] else {}
+            token_usage = _parse_json(row["resp_token_usage"]) if row["resp_token_usage"] else {}
+            has_resp = row["resp_status"] is not None
 
             item = {
                 "request_id": req.get("request_id", ""),
@@ -275,17 +282,17 @@ def get_ai_requests(limit=200):
                 "stream_mode": req.get("stream_mode", False),
                 "session_id": req.get("session_id", ""),
                 "agent_id": req.get("agent_id", ""),
-                "app_name": req.get("app_name", "unknown"),
+                "app_name": req.get("app_name", "") or "unknown",
                 "request_body": req.get("request_body"),
                 "request_body_raw": (json.dumps(req.get("request_body"), ensure_ascii=False)[:2000]
                                      if req.get("request_body") else ""),
-                "response_status": row["response_status"],
+                "response_status": row["resp_status"],
                 "response_headers": resp_headers,
                 "response_body": resp_body,
                 "response_body_raw": (json.dumps(resp_body, ensure_ascii=False)[:4000]
                                       if resp_body else ""),
                 "token_usage": token_usage,
-                "latency_ms": row["latency_ms"],
+                "latency_ms": row["resp_latency_ms"],
                 "has_response": has_resp,
                 "error": None,
             }
@@ -339,7 +346,15 @@ def get_traces(limit=50):
     try:
         # Get recent AI request events with matching responses
         rows = db.execute("""
-            SELECT r.*, resp.response_status, resp.response_body, resp.token_usage, resp.latency_ms
+            SELECT r.id, r.ts, r.ts_unix, r.event, r.decision, r.request_id,
+                   r.agent_id, r.session_id, r.app_name, r.method, r.host,
+                   r.port, r.path, r.model, r.confidence, r.signals,
+                   r.preview, r.prompt_len, r.stream_mode, r.request_headers,
+                   r.request_body,
+                   resp.response_status AS resp_status,
+                   resp.response_body AS resp_body,
+                   resp.token_usage AS resp_token_usage,
+                   resp.latency_ms AS resp_latency_ms
             FROM events r
             LEFT JOIN events resp ON r.request_id = resp.request_id
                 AND resp.event = 'ai_response'
@@ -352,10 +367,10 @@ def get_traces(limit=50):
         for row in rows:
             evt = _row_to_event(row)
             # Merge response fields into the event for trace processing
-            evt["response_status"] = row["response_status"]
-            evt["response_body"] = _parse_json(row["response_body"]) if row["response_body"] else None
-            evt["token_usage"] = _parse_json(row["token_usage"]) if row["token_usage"] else {}
-            evt["latency_ms"] = row["latency_ms"]
+            evt["response_status"] = row["resp_status"]
+            evt["response_body"] = _parse_json(row["resp_body"]) if row["resp_body"] else None
+            evt["token_usage"] = _parse_json(row["resp_token_usage"]) if row["resp_token_usage"] else {}
+            evt["latency_ms"] = row["resp_latency_ms"]
             events.append(evt)
 
         # Group by conversation key = (app_name, first_user_msg)

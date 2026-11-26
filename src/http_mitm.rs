@@ -146,9 +146,9 @@ pub async fn process_http(
                 event: "ai_request_audited".to_string(),
                 decision: "AUDIT".to_string(),
                 request_id: req_id.clone(),
-                agent_id: agent_id.unwrap_or_default(),
-                session_id: session_id.unwrap_or_default(),
-                app_name: app_name.unwrap_or_default(),
+                agent_id: agent_id.clone().unwrap_or_default(),
+                session_id: session_id.clone().unwrap_or_default(),
+                app_name: app_name.clone().unwrap_or_default(),
                 method: method.clone(),
                 host: host.clone(),
                 port: port as i64,
@@ -171,7 +171,7 @@ pub async fn process_http(
             };
 
             audit_log(&event);
-            Some((req_id, Instant::now()))
+            Some((req_id, Instant::now(), app_name.unwrap_or_default(), agent_id.unwrap_or_default(), session_id.unwrap_or_default(), method.clone(), host.clone(), port as i64, path.clone()))
         } else {
             None
         };
@@ -182,8 +182,8 @@ pub async fn process_http(
 
         // Stream response (replaces read_http_response + client.write_all)
         // Returns true if the response signaled Connection: close.
-        let resp_close = if let Some((req_id, t0)) = &request_id {
-            stream_http_response(&mut upstream, client, req_id, *t0).await?
+        let resp_close = if let Some((req_id, t0, ref app_name, ref agent_id, ref session_id, ref method, ref host, req_port, ref path)) = &request_id {
+            stream_http_response(&mut upstream, client, req_id, *t0, app_name, agent_id, session_id, method, host, *req_port, path).await?
         } else {
             stream_response_simple(&mut upstream, client).await?
         };
@@ -261,6 +261,13 @@ async fn stream_http_response(
     client: &mut TlsStream<TcpStream>,
     req_id: &str,
     t0: Instant,
+    app_name: &str,
+    agent_id: &str,
+    session_id: &str,
+    method: &str,
+    host: &str,
+    port: i64,
+    path: &str,
 ) -> Result<bool, BoxError> {
     // 1. Read response headers (up to \r\n\r\n), with 60s timeout
     let mut header_buf = Vec::with_capacity(8192);
@@ -371,13 +378,13 @@ async fn stream_http_response(
         event: "ai_response".to_string(),
         decision: String::new(),
         request_id: req_id.to_string(),
-        agent_id: String::new(),
-        session_id: String::new(),
-        app_name: String::new(),
-        method: String::new(),
-        host: String::new(),
-        port: 0,
-        path: String::new(),
+        agent_id: agent_id.to_string(),
+        session_id: session_id.to_string(),
+        app_name: app_name.to_string(),
+        method: method.to_string(),
+        host: host.to_string(),
+        port,
+        path: path.to_string(),
         model: String::new(),
         confidence: 0,
         signals: Vec::new(),

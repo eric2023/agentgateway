@@ -117,7 +117,13 @@ pub fn lookup_peer(peer_port: u16, peer_ip: IpAddr) -> PeerInfo {
 }
 
 /// Find socket inode by local port, scanning /proc/net/tcp and tcp6.
-fn find_socket_inode(peer_port: u16, exclude_port: u16) -> Option<String> {
+/// Matches the client-side socket whose local port = peer_port.
+/// The client connected to :443, but iptables REDIRECT rewrote the destination
+/// to 127.0.0.1:8444. So the client socket in /proc/net/tcp shows:
+///   client_ip:peer_port -> 127.0.0.1:8444
+/// We must NOT skip these — the old exclude_port check was wrong and skipped
+/// the very sockets we need.
+fn find_socket_inode(peer_port: u16, _exclude_port: u16) -> Option<String> {
     for proc_file in &["/proc/net/tcp", "/proc/net/tcp6"] {
         if let Ok(content) = fs::read_to_string(proc_file) {
             for (i, line) in content.lines().enumerate() {
@@ -141,16 +147,10 @@ fn find_socket_inode(peer_port: u16, exclude_port: u16) -> Option<String> {
                 if local_port != peer_port {
                     continue;
                 }
-                let remote_port = match parts[2].split(':').nth(1) {
-                    Some(s) => match u16::from_str_radix(s, 16) {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    },
-                    None => continue,
-                };
-                if remote_port == exclude_port {
-                    continue;
-                }
+                // Skip the proxy's own listening/accepted sockets (local addr = 127.0.0.1:8444)
+                // The proxy's accepted socket has local_port=8444, so it won't match peer_port.
+                // But the proxy's upstream socket has local_port=ephemeral, remote=443 — also won't match.
+                // The client socket has local_port=peer_port, remote=8444 (after REDIRECT).
                 return Some(parts[9].to_string());
             }
         }
