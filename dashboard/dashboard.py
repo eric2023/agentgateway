@@ -442,10 +442,16 @@ def render_html(stats, requests):
     if not _html_template:
         return "<h1>Dashboard template not found</h1>"
     html = _html_template
-    html = html.replace("{{TOTAL}}", str(stats.get("total", 0)))
-    html = html.replace("{{BLOCKED}}", str(stats.get("blocked_count", 0)))
-    html = html.replace("{{FORWARDED}}", str(stats.get("forwarded_count", 0)))
-    html = html.replace("{{AUDITED}}", str(stats.get("audited_count", 0)))
+    html = html.replace("__TOTAL__", str(stats.get("total", 0)))
+    html = html.replace("__BLOCKED__", str(stats.get("blocked_count", 0)))
+    html = html.replace("__FORWARDED__", str(stats.get("forwarded_count", 0)))
+    html = html.replace("__AUDITED__", str(stats.get("audited_count", 0)))
+    import json as _json
+    tl = stats.get("timeline", [])
+    md = stats.get("models", [])
+    html = html.replace("__TIMELINE_DATA__", _json.dumps(tl, ensure_ascii=False))
+    html = html.replace("__MODEL_DATA__", _json.dumps(md, ensure_ascii=False))
+    html = html.replace("__HOST_ROWS__", "")
     return html
 
 
