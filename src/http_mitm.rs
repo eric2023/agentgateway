@@ -65,13 +65,17 @@ impl UpstreamConnector {
     }
 }
 
-/// Process a single HTTP/1.1 request over a TLS connection.
-/// Does NOT loop (disables HTTP pipelining to avoid request/response misalignment).
+/// Process HTTP/1.1 requests over a TLS connection with keep-alive.
+/// Loops to handle multiple sequential requests on the same connection
+/// (request→response→request→response), which keeps keep-alive working
+/// while still disabling pipelining (pipelining sends the next request
+/// before the prior response arrives).
 /// For each request:
 ///   1. Read the full request (method, path, headers, body)
 ///   2. If AI request: audit + capture response
 ///   3. Forward to upstream
 ///   4. Return response to client
+///   5. Loop and wait for the next request (keep-alive)
 pub async fn process_http(
     client: &mut TlsStream<TcpStream>,
     mut upstream: tokio_rustls::client::TlsStream<TcpStream>,
@@ -79,94 +83,107 @@ pub async fn process_http(
     peer_addr: SocketAddr,
     sni: Option<&str>,
 ) -> Result<(), BoxError> {
-    let host = sni.map(|s| s.to_string()).unwrap_or_else(|| orig_dst.ip().to_string());
+    // host and port are computed outside the loop (initialized from SNI/IP).
+    // host is updated per-request from the HTTP Host header when available (NEW-9).
+    let mut host = sni.map(|s| s.to_string()).unwrap_or_else(|| orig_dst.ip().to_string());
     let port = orig_dst.port();
 
-    // Read HTTP request from client (with 30s timeout)
-    let req_data = match tokio::time::timeout(
-        Duration::from_secs(30),
-        read_http_request(client),
-    ).await {
-        Ok(Ok(Some(data))) => data,
-        Ok(Ok(None)) => return Ok(()), // client closed
-        Ok(Err(e)) => return Err(Box::new(e)),
-        Err(_) => return Err("request read timeout".into()),
-    };
-
-    // Parse request line + headers
-    let (method, path, headers, header_len) = match parse_request_head(&req_data) {
-        Some(r) => r,
-        None => {
-            // Can't parse — forward as-is and hope for the best
-            upstream.write_all(&req_data).await?;
-            return Ok(());
-        }
-    };
-
-    let body = if req_data.len() > header_len {
-        req_data[header_len..].to_vec()
-    } else {
-        Vec::new()
-    };
-
-    // Check if this is an AI request
-    let (is_ai, confidence, signals, detail) = detect_ai_request(
-        &method, &path, &headers, &body,
-    );
-
-    let request_id = if is_ai {
-        let req_id = format!("req-{}", uuid_v4());
-
-        // Process attribution
-        let peer_port = peer_addr.port();
-        let (_agent_pid, _agent_comm, app_name, agent_id, session_id) =
-            attribution::lookup_peer(peer_port, peer_addr.ip());
-
-        let request_body_json: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
-
-        let event = AuditEvent {
-            event: "ai_request_audited".to_string(),
-            decision: "AUDIT".to_string(),
-            request_id: req_id.clone(),
-            agent_id: agent_id.unwrap_or_default(),
-            session_id: session_id.unwrap_or_default(),
-            app_name: app_name.unwrap_or_default(),
-            method: method.clone(),
-            host: host.clone(),
-            port: port as i64,
-            path: path.clone(),
-            model: detail.get("model").map(|v| v.to_string()).unwrap_or_default(),
-            confidence: confidence as i64,
-            signals: signals.clone(),
-            preview: detail.get("preview").map(|v| v.to_string()).unwrap_or_default(),
-            prompt_len: detail.get("prompt_len").and_then(|v| v.as_u64()).unwrap_or(0) as i64,
-            stream_mode: detail.get("stream_mode").and_then(|v| v.as_bool()).unwrap_or(false),
-            request_headers: headers_to_json(&headers),
-            request_body: request_body_json,
-            response_status: None,
-            response_headers: None,
-            response_body: None,
-            token_usage: None,
-            latency_ms: None,
-            summary: format!("AI request audited & forwarded: {} {}{} model={}", method, host, path, detail.get("model").map(|m| m.as_str().unwrap_or("")).unwrap_or("")),
-            source: "rust_proxy".to_string(),
+    loop {
+        // Read HTTP request from client (with 30s timeout).
+        // A read timeout or client close ends the keep-alive loop gracefully.
+        let req_data = match tokio::time::timeout(
+            Duration::from_secs(30),
+            read_http_request(client),
+        ).await {
+            Ok(Ok(Some(data))) => data,
+            Ok(Ok(None)) => return Ok(()), // client closed
+            Ok(Err(e)) => return Err(Box::new(e)),
+            Err(_) => return Ok(()), // read timeout — close connection gracefully
         };
 
-        audit_log(&event);
-        Some((req_id, Instant::now()))
-    } else {
-        None
-    };
+        // Parse request line + headers
+        let (method, path, headers, header_len) = match parse_request_head(&req_data) {
+            Some(r) => r,
+            None => {
+                // Can't parse — forward as-is and hope for the best
+                upstream.write_all(&req_data).await?;
+                return Ok(());
+            }
+        };
 
-    // Forward request to upstream
-    upstream.write_all(&req_data).await?;
-    upstream.flush().await?;
+        // Prefer the HTTP Host header over SNI/IP for the audit host (NEW-9).
+        // Strip the port number if present.
+        if let Some((_, h)) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")) {
+            host = h.split(':').next().unwrap_or(h).to_string();
+        }
 
-    // Stream response (replaces read_http_response + client.write_all)
-    if let Some((req_id, t0)) = &request_id {
-        stream_http_response(&mut upstream, client, req_id, *t0).await
-    } else {
-        stream_response_simple(&mut upstream, client).await
+        let body = if req_data.len() > header_len {
+            req_data[header_len..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        // Check if this is an AI request
+        let (is_ai, confidence, signals, detail) = detect_ai_request(
+            &method, &path, &headers, &body,
+        );
+
+        let request_id = if is_ai {
+            let req_id = format!("req-{}", uuid_v4());
+
+            // Process attribution
+            let peer_port = peer_addr.port();
+            let (_agent_pid, _agent_comm, app_name, agent_id, session_id) =
+                attribution::lookup_peer(peer_port, peer_addr.ip());
+
+            let request_body_json: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+
+            let event = AuditEvent {
+                event: "ai_request_audited".to_string(),
+                decision: "AUDIT".to_string(),
+                request_id: req_id.clone(),
+                agent_id: agent_id.unwrap_or_default(),
+                session_id: session_id.unwrap_or_default(),
+                app_name: app_name.unwrap_or_default(),
+                method: method.clone(),
+                host: host.clone(),
+                port: port as i64,
+                path: path.clone(),
+                model: detail.get("model").map(|v| v.to_string()).unwrap_or_default(),
+                confidence: confidence as i64,
+                signals: signals.clone(),
+                preview: detail.get("preview").map(|v| v.to_string()).unwrap_or_default(),
+                prompt_len: detail.get("prompt_len").and_then(|v| v.as_u64()).unwrap_or(0) as i64,
+                stream_mode: detail.get("stream_mode").and_then(|v| v.as_bool()).unwrap_or(false),
+                request_headers: headers_to_json(&headers),
+                request_body: request_body_json,
+                response_status: None,
+                response_headers: None,
+                response_body: None,
+                token_usage: None,
+                latency_ms: None,
+                summary: format!("AI request audited & forwarded: {} {}{} model={}", method, host, path, detail.get("model").map(|m| m.as_str().unwrap_or("")).unwrap_or("")),
+                source: "rust_proxy".to_string(),
+            };
+
+            audit_log(&event);
+            Some((req_id, Instant::now()))
+        } else {
+            None
+        };
+
+        // Forward request to upstream
+        upstream.write_all(&req_data).await?;
+        upstream.flush().await?;
+
+        // Stream response (replaces read_http_response + client.write_all)
+        if let Some((req_id, t0)) = &request_id {
+            stream_http_response(&mut upstream, client, req_id, *t0).await?;
+        } else {
+            stream_response_simple(&mut upstream, client).await?;
+        }
+
+        // Loop continues — wait for the next request on the same connection (keep-alive).
     }
 }
 
