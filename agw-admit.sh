@@ -143,18 +143,82 @@ export AGENTGATEWAY_APP_NAME="$APP_NAME"
 export AGENTGATEWAY_AGENT_ID="$AGENT_ID"
 export AGENTGATEWAY_SESSION_ID="$SESSION_ID"
 
-# Admit this process into the net_cls cgroup
-if [[ -w "$CGROUP_TASKS" ]]; then
-    echo $$ > "$CGROUP_TASKS"
-else
-    echo "[agw-admit] WARNING: cannot write to $CGROUP_TASKS" >&2
-    echo "[agw-admit] Run setup_iptables.sh first to create the cgroup." >&2
-fi
+# ─── Admit into cgroup ─────────────────────────────────────────────────────
+# Detect cgroup version: V25 uses cgroup v2 unified (/sys/fs/cgroup is cgroup2fs),
+# V20 uses cgroup v1 net_cls (/sys/fs/cgroup/net_cls/).
+CGROUP_V2_ROOT="/sys/fs/cgroup"
+CGROUP_V2_AGW="$CGROUP_V2_ROOT/agentgateway/agents"
+AGW_DIR="$(cd "$(dirname "$0")" && pwd)"
+ADMitted="no"
 
+if [[ "$(stat -fc %T "$CGROUP_V2_ROOT" 2>/dev/null)" == "cgroup2fs" ]]; then
+    # ── V25: cgroup v2 unified ──
+    # Create a per-agent cgroup under /sys/fs/cgroup/agentgateway/agents/<agent-id>/
+    # and move this process into it. The BPF-LSM identity_map is keyed by cgroup
+    # id, populated by bpf/agent_admit (which needs root — run via sudo if the
+    # BPF-LSM loader is active). The nftables rule matches cgroupv2 level 1
+    # "agentgateway" so any process in this subtree gets redirected.
+    AGENT_CG="$CGROUP_V2_AGW/$AGENT_ID"
+    # cgroup v2: writing cgroup.procs requires root (CAP_SYS_ADMIN) when moving
+    # across cgroup hierarchies (current process is under user.slice, target is
+    # under agentgateway/). The agent_admit helper writes identity_map AND moves
+    # the PID into the cgroup in one root call. Both need sudo.
+    ADMIT_BIN="$AGW_DIR/bpf/agent_admit"
+    # sudo helper: use AGW_SUDO_PASS env var (sudo -S) if set, else sudo -n (cached)
+    agw_sudo() {
+        if [[ -n "${AGW_SUDO_PASS:-}" ]]; then
+            printf '%s\n' "$AGW_SUDO_PASS" | sudo -S -p '' "$@"
+        else
+            sudo -n "$@"
+        fi
+    }
+    agw_sudo_ok() {
+        if [[ -n "${AGW_SUDO_PASS:-}" ]]; then
+            printf '%s\n' "$AGW_SUDO_PASS" | sudo -S -p '' true 2>/dev/null
+        else
+            sudo -n true 2>/dev/null
+        fi
+    }
+    if mkdir -p "$AGENT_CG" 2>/dev/null; then
+        if [[ -x "$ADMIT_BIN" ]] && agw_sudo_ok; then
+            # agent_admit: <name> <agent-id> <session-id> <app> [pid...]
+            # It creates the cgroup, writes identity_map, and moves the PID.
+            agw_sudo "$ADMIT_BIN" "$AGENT_ID" "$AGENT_ID" "$SESSION_ID" "$APP_NAME" $$ 2>/dev/null \
+                && echo "[agw-admit] BPF-LSM identity registered + cgroup joined" \
+                || echo "[agw-admit] WARNING: agent_admit failed (run agent_lsm loader?)" >&2
+            ADMitted="yes"
+            CGROUP_DESC="$AGENT_CG (cgroup v2 + BPF-LSM)"
+        elif agw_sudo_ok; then
+            agw_sudo bash -c "echo $$ > '$AGENT_CG/cgroup.procs'" 2>/dev/null \
+                && ADMitted="yes" \
+                || echo "[agw-admit] WARNING: cannot write cgroup.procs" >&2
+            CGROUP_DESC="$AGENT_CG (cgroup v2, no BPF-LSM identity)"
+        else
+            echo "[agw-admit] NOTE: sudo required for cgroup v2 join + BPF-LSM identity" >&2
+            echo "[agw-admit] Without sudo, traffic will NOT be redirected (nftables matches cgroup)" >&2
+            echo "[agw-admit] Set AGW_SUDO_PASS or run: sudo -v" >&2
+            CGROUP_DESC="$AGENT_CG (cgroup v2, needs sudo)"
+        fi
+    else
+        echo "[agw-admit] WARNING: cannot create $AGENT_CG" >&2
+        echo "[agw-admit] Run setup_v25.sh first to create the cgroup subtree." >&2
+        CGROUP_DESC="(none)"
+    fi
+elif [[ -w "$CGROUP_TASKS" ]]; then
+    # ── V20: cgroup v1 net_cls ──
+    echo $$ > "$CGROUP_TASKS"
+    ADMitted="yes"
+    CGROUP_DESC="$CGROUP_TASKS (cgroup v1 net_cls)"
+else
+    echo "[agw-admit] WARNING: cannot admit into any cgroup" >&2
+    echo "[agw-admit] V20: run setup_iptables.sh;  V25: run setup_v25.sh" >&2
+    CGROUP_DESC="(none)"
+fi
 echo "[agentgateway] Agent ID:   $AGENT_ID"
 echo "[agentgateway] Session ID: $SESSION_ID"
 echo "[agentgateway] App:        $APP_NAME"
-echo "[agentgateway] Cgroup:     $CGROUP_TASKS"
+echo "[agentgateway] Cgroup:     $CGROUP_DESC"
+echo "[agentgateway] Admitted:   $ADMitted"
 echo "[agentgateway] Command:    $@"
 echo "[agentgateway] ─────────────────────────────────"
 

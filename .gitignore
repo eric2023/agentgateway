@@ -2,7 +2,7 @@
 certs/dyn-*
 certs/*-key.pem
 certs/ca-key.pem
-certs/ca-cert.pem
+certs/*.bak
 
 # Logs
 logs/
@@ -36,6 +36,9 @@ bpf/seccomp_confirm
 *.swp
 *~
 
+# Distribution / packaging artifacts (generated, not tracked)
+/dist/
+/packaging/
 
 # Added by cargo
 

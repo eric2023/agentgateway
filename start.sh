@@ -19,7 +19,10 @@ PROXY_LOG="$LOG_DIR/proxy.log"
 DASHBOARD_LOG="$LOG_DIR/dashboard.log"
 PROXY_PIDFILE="$LOG_DIR/proxy.pid"
 DASHBOARD_PIDFILE="$LOG_DIR/dashboard.pid"
-
+BPF_LSM_PIDFILE="$LOG_DIR/bpf_lsm.pid"
+BPF_LSM_LOG="$LOG_DIR/bpf_lsm.log"
+AUDIT_CONSUMER_PIDFILE="$LOG_DIR/audit_consumer.pid"
+AUDIT_CONSUMER_LOG="$LOG_DIR/audit_consumer.log"
 PYTHON="$(command -v python3 || true)"
 if [[ -z "$PYTHON" ]]; then
     PYTHON="/home/ut000520@uos/.pyenv/shims/python3"
@@ -29,7 +32,23 @@ PROXY_PORT=8444
 
 mkdir -p "$LOG_DIR"
 
+# ─── platform detection ────────────────────────────────────────────────────
+# V25: cgroup v2 unified (/sys/fs/cgroup is cgroup2fs) → nftables + BPF-LSM
+# V20: cgroup v1 net_cls (/sys/fs/cgroup/net_cls/) → iptables-legacy
+is_cgroup_v2() {
+    [[ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" == "cgroup2fs" ]]
+}
+is_v25() { is_cgroup_v2; }
 # ─── helpers ────────────────────────────────────────────────────────────────
+
+# sudo wrapper: use AGW_SUDO_PASS env var (sudo -S) if set, else plain sudo
+agw_sudo() {
+    if [[ -n "${AGW_SUDO_PASS:-}" ]]; then
+        printf '%s\n' "$AGW_SUDO_PASS" | sudo -S -p '' "$@"
+    else
+        sudo "$@"
+    fi
+}
 
 # Wait for a TCP port to become connectable (replaces fixed sleep, C20)
 wait_for_port() {
@@ -64,6 +83,24 @@ stop_proc() {
             sleep 0.3
         done
         kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+        echo "[start.sh] $name stopped."
+    else
+        echo "[start.sh] $name not running."
+    fi
+    rm -f "$pidfile"
+}
+stop_proc_root() {
+    local name="$1" pidfile="$2"
+    local pid
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && agw_sudo kill -0 "$pid" 2>/dev/null; then
+        echo "[start.sh] Stopping $name (pid=$pid) ..."
+        agw_sudo kill "$pid" 2>/dev/null || true
+        for _ in $(seq 1 10); do
+            agw_sudo kill -0 "$pid" 2>/dev/null || break
+            sleep 0.3
+        done
+        agw_sudo kill -0 "$pid" 2>/dev/null && agw_sudo kill -9 "$pid" 2>/dev/null || true
         echo "[start.sh] $name stopped."
     else
         echo "[start.sh] $name not running."
@@ -155,25 +192,94 @@ proxy_cmd() {
 do_stop() {
     stop_proc "proxy" "$PROXY_PIDFILE"
     stop_proc "dashboard" "$DASHBOARD_PIDFILE"
+    # V25-only: stop audit consumer (root) and BPF-LSM loader (root)
+    if is_v25; then
+        stop_proc_root "audit_consumer" "$AUDIT_CONSUMER_PIDFILE"
+        # BPF-LSM runs under strace wrapper; kill both strace and agent_lsm
+        stop_proc_root "bpf_lsm(strace)" "$BPF_LSM_PIDFILE"
+        agw_sudo pkill -TERM -x strace 2>/dev/null || true
+        agw_sudo pkill -TERM -x agent_lsm 2>/dev/null || true
+        sleep 1
+        agw_sudo pkill -KILL -x strace 2>/dev/null || true
+        agw_sudo pkill -KILL -x agent_lsm 2>/dev/null || true
+        # Clean up pinned BPF maps so the next start doesn't hit stale pins
+        agw_sudo rm -rf /sys/fs/bpf/agentgateway 2>/dev/null || true
+    fi
 }
-
 do_start() {
-    # Stop existing instances first (clean restart).
-    do_stop 2>/dev/null || true
+    # Stop existing proxy/dashboard first (clean restart).
+    stop_proc "proxy" "$PROXY_PIDFILE" 2>/dev/null || true
+    stop_proc "dashboard" "$DASHBOARD_PIDFILE" 2>/dev/null || true
     kill_stale_proxy
 
-    # Health checks: verify iptables rule and CA are installed
+    # Health checks: verify CA + cgroup are ready (platform-specific)
     if [[ ! -f /usr/local/share/ca-certificates/agentgateway-ca.crt ]]; then
         echo "[start.sh] WARNING: System CA not installed. Run './start.sh setup' first."
     fi
-    if [[ ! -w /sys/fs/cgroup/net_cls/agentgateway/tasks ]]; then
-        echo "[start.sh] WARNING: cgroup not ready. Run './start.sh setup' first."
+    if is_v25; then
+        if [[ ! -d /sys/fs/cgroup/agentgateway/agents ]]; then
+            echo "[start.sh] WARNING: cgroup v2 subtree not ready. Run './start.sh setup' first."
+        fi
+        if ! agw_sudo iptables-legacy -t nat -L OUTPUT 2>/dev/null | grep -q agentgateway; then
+            echo "[start.sh] WARNING: iptables-legacy cgroup v2 redirect rules not found. Run './start.sh setup' first."
+        fi
+    else
+        if [[ ! -w /sys/fs/cgroup/net_cls/agentgateway/tasks ]]; then
+            echo "[start.sh] WARNING: cgroup not ready. Run './start.sh setup' first."
+        fi
+    fi
+
+    # V25: start BPF-LSM loader (root) via systemd-run transient service.
+    # Using systemd-run avoids nohup/disown issues and properly daemonizes
+    # the process. BPF maps auto-detach on process death, and the loader
+    # unpins stale pins before re-pinning (so no cleanup needed here).
+    if is_v25; then
+        if ! agw_sudo kill -0 "$(cat "$BPF_LSM_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+            LSM_BIN="$PROJECT_DIR/bpf/agent_lsm"
+            if [[ -x "$LSM_BIN" ]]; then
+                # Workaround: on this UOS 6.6 kernel, a background BPF-LSM
+                # loader loses its BPF map fds after pinning (likely a DDE
+                # security module interference). Running under strace (ptrace)
+                # prevents the fd closure. strace -f follows forks, -o /dev/null
+                # discards trace output.
+                local strace_bin=""
+                command -v strace &>/dev/null && strace_bin="strace"
+                if [[ -n "$strace_bin" ]]; then
+                    echo "[start.sh] Starting BPF-LSM loader (root, strace-wrapped)..."
+                    agw_sudo bash -c "cd '$PROJECT_DIR' && AGW_ENFORCE_FILE_WRITE='${AGW_ENFORCE_FILE_WRITE:-0}' strace -f -o /tmp/agw_bpf_strace.log '$LSM_BIN' < /dev/null > '$BPF_LSM_LOG' 2>&1 & disown; echo \$! > '$BPF_LSM_PIDFILE'"
+                else
+                    echo "[start.sh] Starting BPF-LSM loader (root)..."
+                    agw_sudo bash -c "cd '$PROJECT_DIR' && AGW_ENFORCE_FILE_WRITE='${AGW_ENFORCE_FILE_WRITE:-0}' nohup '$LSM_BIN' > '$BPF_LSM_LOG' 2>&1 & disown; echo \$! > '$BPF_LSM_PIDFILE'"
+                fi
+                # Wait briefly for maps to be pinned (bpffs requires root to traverse)
+                for _ in $(seq 1 20); do
+                    agw_sudo test -f /sys/fs/bpf/agentgateway/audit_buf 2>/dev/null && break
+                    sleep 0.5
+                done
+            else
+                echo "[start.sh] WARNING: BPF-LSM binary not found at $LSM_BIN (build with: cd bpf && make)" >&2
+            fi
+        else
+            echo "[start.sh] BPF-LSM loader already running (pid=$(cat "$BPF_LSM_PIDFILE"))"
+        fi
     fi
 
     start_proc "proxy" "$(proxy_cmd)" "$PROXY_PIDFILE" "$PROXY_LOG"
     # Wait for proxy port to be ready (replaces fixed sleep, C20)
     wait_for_port "$PROXY_PORT" 50 || echo "[start.sh] WARNING: proxy port not ready yet"
     start_proc "dashboard" "$PYTHON $DASHBOARD" "$DASHBOARD_PIDFILE" "$DASHBOARD_LOG"
+
+    # V25: start audit consumer (BPF ring buffer → SQLite). Must run as root
+    # because bpffs (BPF filesystem) ignores Unix file permissions and requires
+    # CAP_SYS_ADMIN to open pinned maps, even with setcap.
+    if is_v25; then
+        if agw_sudo test -f /sys/fs/bpf/agentgateway/audit_buf 2>/dev/null; then
+            echo "[start.sh] Starting BPF audit consumer → SQLite (root)..."
+            agw_sudo bash -c "nohup '$PROJECT_DIR/bpf/audit_consumer' --sqlite '$PROJECT_DIR/audit/audit.db' > '$AUDIT_CONSUMER_LOG' 2>&1 & disown; echo \$! > '$AUDIT_CONSUMER_PIDFILE'"
+        else
+            echo "[start.sh] NOTE: BPF audit_buf not pinned (BPF-LSM not loaded?) — audit_consumer skipped" >&2
+        fi
+    fi
 
     echo
     echo "[start.sh] ─────────────────────────────────────"
@@ -236,11 +342,29 @@ do_status() {
     else
         echo "[start.sh] Dashboard: stopped"
     fi
+    if is_v25; then
+        if agw_sudo kill -0 "$(cat "$BPF_LSM_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+            echo "[start.sh] BPF-LSM: running (pid=$(cat "$BPF_LSM_PIDFILE"))"
+        else
+            echo "[start.sh] BPF-LSM: stopped"
+        fi
+        if agw_sudo kill -0 "$(cat "$AUDIT_CONSUMER_PIDFILE" 2>/dev/null)" 2>/dev/null; then
+            echo "[start.sh] audit_consumer: running (pid=$(cat "$AUDIT_CONSUMER_PIDFILE"))"
+        else
+            echo "[start.sh] audit_consumer: stopped"
+        fi
+    fi
 }
 
 do_setup() {
     echo "[start.sh] Running one-time root setup..."
-    sudo --preserve-env=HOME bash "$PROJECT_DIR/setup_iptables.sh"
+    if is_v25; then
+        echo "[start.sh] Detected V25 (cgroup v2) — using setup_v25.sh + BPF-LSM"
+        agw_sudo bash -c "export HOME='$HOME'; '$PROJECT_DIR/setup_v25.sh' --bpf"
+    else
+        echo "[start.sh] Detected V20 (cgroup v1 net_cls) — using setup_iptables.sh"
+        agw_sudo bash -c "export HOME='$HOME'; '$PROJECT_DIR/setup_iptables.sh'"
+    fi
 }
 
 # ─── main ───────────────────────────────────────────────────────────────────

@@ -231,6 +231,99 @@ tail -f audit/audit.jsonl | python3 -m json.tool
 # http://127.0.0.1:9090
 ```
 
+## V25 端到端验证（6.6 内核 / cgroup v2 + BPF-LSM）
+
+> V25 在 V20 基础上增加 BPF-LSM 内核级审计。`start.sh` 自动检测平台，以下步骤在 V25 / 6.6.0 内核 / cgroup v2 统一层上验证通过。
+> 通过 `AGW_SUDO_PASS` 环境变量传入 sudo 密码，无需手动输入。
+
+### 0. 构建（V25 额外需 BPF 工具链）
+
+```bash
+# Rust 代理
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo build --release          # 产物 target/release/agentgateway
+cargo test --release           # 5/5 单元测试通过
+
+# BPF 工具链（需 ~/agentgateway-toolchain: clang-17 + bpftool + libbpf-dev）
+cd bpf && make                 # 全部构建通过
+```
+
+### 1. 一次性 root 设置（V25）
+
+```bash
+export AGW_SUDO_PASS='<sudo密码>'
+./start.sh setup --bpf
+# 执行内容：
+#   1. 创建 cgroup v2 /sys/fs/cgroup/agentgateway/agents/
+#   2. 安装 CA 到 /usr/local/share/ca-certificates/ + update-ca-certificates
+#   3. iptables-legacy REDIRECT: -m cgroup --path agentgateway → :8444
+#   4. （BPF-LSM 在 start.sh start 时加载，非 setup 阶段）
+```
+
+验证：
+```bash
+sudo iptables-legacy -t nat -L OUTPUT -n | grep agentgateway   # 应见 REDIRECT tcp dpt:443 to:8444
+ls /sys/fs/cgroup/agentgateway/agents/                          # 应存在
+cat /sys/kernel/security/lsm | grep bpf                         # 应包含 bpf
+```
+
+### 2. 启动代理 + 仪表盘 + BPF-LSM（V25）
+
+```bash
+export AGW_SUDO_PASS='<sudo密码>'
+./start.sh start
+./start.sh status
+# 应显示：proxy running, Dashboard running, BPF-LSM running, audit_consumer running
+```
+
+> **strace 包裹说明**：在 UOS 6.6 内核上，后台运行的 BPF-LSM Loader 在 pin maps 后会
+> 丢失所有 BPF map fds（原因疑似 DDE 安全模块干扰）。使用 `strace -f` 包裹可防止
+> fd 丢失。`start.sh` 自动检测 strace 并使用它包裹 BPF-LSM Loader。
+
+### 3. 通过 agw-admit 启动 Agent（V25）
+
+```bash
+export AGW_SUDO_PASS='<sudo密码>'
+./agw-admit.sh --app "TestApp" curl -sS \
+  --cacert certs/ca-cert.pem \
+  -X POST https://ai.uniontech.com/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer test-key' \
+  -d '{"model":"glm-5","messages":[{"role":"user","content":"hello"}]}'
+```
+
+### 4. 验证审计落库（V25）
+
+```bash
+# Rust 代理审计（events 表 — AI 请求 L7 识别）
+sqlite3 audit/audit.db "SELECT ts,event,app_name,host,path FROM events ORDER BY id DESC LIMIT 5;"
+
+# BPF-LSM 审计（bpf_events 表 — 内核强制层 file_open 事件）
+sqlite3 audit/audit.db "SELECT ts,event,decision,op,app_name FROM bpf_events ORDER BY id DESC LIMIT 5;"
+```
+
+### 5. 清理（V25）
+
+```bash
+export AGW_SUDO_PASS='<sudo密码>'
+./start.sh stop
+sudo bash setup_v25.sh --cleanup    # 移除 iptables-legacy 规则 + cgroup + BPF pins
+```
+
+### 双平台差异总结
+
+| 维度 | V20（方案C） | V25（方案B） |
+|------|-------------|-------------|
+| cgroup | v1 net_cls (classid 0x100001) | v2 统一层 (/agentgateway/agents/) |
+| 重定向 | iptables-legacy REDIRECT | iptables-legacy REDIRECT (`-m cgroup --path agentgateway`) |
+| 内核强制 | 无 | BPF-LSM (file_open/bprm_check 审计；socket_connect 仅审计，DENY :443 已禁用) |
+| 审计通道 | SQLite (events 表) | SQLite (events 表 + bpf_events 表) |
+| 身份模型 | 环境变量 + /proc 父进程链 | BPF identity_map (cgroup_id → identity) + 环境变量 |
+| 设置脚本 | setup_iptables.sh | setup_v25.sh --bpf |
+| start.sh | 自动检测 cgroup v1 → iptables 路径 | 自动检测 cgroup v2 → iptables-legacy + BPF-LSM 路径 |
+| BPF-LSM 启动 | N/A | strace -f 包裹（防止 fd 丢失），root 权限 |
+| audit_consumer | N/A | root 权限（bpffs 需要 CAP_SYS_ADMIN） |
+
 ## 仪表盘
 
 打开 `http://127.0.0.1:9090` 查看仪表盘。
@@ -316,7 +409,34 @@ echo 0x100001 > /sys/fs/cgroup/net_cls/agentgateway/net_cls.classid
 # 允许普通用户写入（agw-admit 使用）
 chmod 666 /sys/fs/cgroup/net_cls/agentgateway/tasks
 ```
+### iptables-legacy 规则（V25 / cgroup v2）
 
+V25（6.6 内核，cgroup v2 统一层）使用 iptables-legacy `-m cgroup --path` 匹配 cgroup v2 路径，
+替代 V20 的 net_cls classid。nftables `socket cgroupv2` 在 OUTPUT NAT 链匹配 counter 但不实际做 NAT
+（socket→cgroup 关联在 dstnat hook 不可见），因此选用 iptables-legacy：
+
+```bash
+# 重定向 cgroup v2 "agentgateway" 子树进程的 :443/:8443/:9443 到 :8444
+iptables-legacy -t nat -A OUTPUT \
+  -m cgroup --path agentgateway \
+  -p tcp --dport 443 -j REDIRECT --to-ports 8444
+iptables-legacy -t nat -A OUTPUT \
+  -m cgroup --path agentgateway \
+  -p tcp --dport 8443 -j REDIRECT --to-ports 8444
+iptables-legacy -t nat -A OUTPUT \
+  -m cgroup --path agentgateway \
+  -p tcp --dport 9443 -j REDIRECT --to-ports 8444
+```
+
+```bash
+# cgroup v2 路径
+/sys/fs/cgroup/agentgateway/agents/<agent-id>/
+
+# 允许普通用户创建子 cgroup（agw-admit 使用）
+chmod 775 /sys/fs/cgroup/agentgateway/agents
+```
+
+> **双平台支持**：`setup_iptables.sh` 用于 V20（cgroup v1 net_cls），`setup_v25.sh` 用于 V25（cgroup v2 + iptables-legacy + BPF-LSM）。`start.sh` 自动检测平台。
 ## 停止服务
 
 ```bash
@@ -330,13 +450,15 @@ sudo bash setup_iptables.sh --cleanup
 
 | 限制 | 影响 | 缓解 |
 |---|---|---|
-| 需 root 设置 iptables | 一次性操作 | `./start.sh setup` |
-| agw-admit 写 cgroup/tasks 需权限 | `chmod 666 tasks` 解决 | setup 脚本自动设置 |
-| cgroup v1 net_cls 已弃用 | 4.19 仍完全支持 | 6.6+ 可迁移到 cgroup v2 + BPF |
-| 无文件管控 | 无法限制文件读写 | 需 6.6+ BPF-LSM |
-| 无自保护 | Agent 可杀网关进程 | 需 6.6+ BPF-LSM security_bpf |
-| cert pinning 应用 | 不信任系统 CA | 需 6.6+ BPF uprobe 取明文 |
+| 需 root 设置 iptables-legacy | 一次性操作 | `./start.sh setup --bpf` |
+| agw-admit 写 cgroup 需权限 | chmod 解决 | setup 脚本自动设置 |
+| ~~cgroup v1 net_cls 已弃用~~ | V20 仍完全支持 | V25 迁移到 cgroup v2 + iptables-legacy（`setup_v25.sh`） |
+| ~~无文件管控~~ | V20 无法限制文件读写 | V25 BPF-LSM `file_open`（`setup_v25.sh --bpf`） |
+| ~~无自保护~~ | V20 Agent 可杀网关 | V25 BPF-LSM `security_bpf` |
+| cert pinning 应用 | 不信任系统 CA | V25 BPF uprobe 取明文（`bpf/agent_uprobe`） |
 | HTTP/2 上游 | 当前仅支持 HTTP/1.1 上游连接 | 大多数 AI API 支持 HTTP/1.1 |
+| V25 需 Rust 工具链 | cargo 构建 | `rustup` 或 `apt install cargo`（≥1.80，LazyLock） |
+| V25 需 BPF 工具链 | clang-17 + libbpf | 本地 toolchain prefix（`~/agentgateway-toolchain`） |
 
 ## 技术方案文档
 

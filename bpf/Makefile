@@ -32,7 +32,7 @@ agent_lsm: agent_lsm.c agent_lsm.skel.h
 	$(CC) -g -Wall -O2 $(INCLUDES) $< -o $@ $(LDFLAGS)
 
 audit_consumer: audit_consumer.c agent_common.h
-	$(CC) -g -Wall -O2 $(INCLUDES) $< -o $@ $(LDFLAGS)
+	$(CC) -g -Wall -O2 $(INCLUDES) $< -o $@ $(LDFLAGS) -lsqlite3
 
 cgroupid: cgroupid.c
 	$(CC) -g -Wall -O2 $< -o $@

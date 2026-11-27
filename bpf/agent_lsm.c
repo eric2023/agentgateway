@@ -40,7 +40,7 @@ int main(int argc, char **argv)
     __u32 key = 0;
     int err = 1;
 
-    cfg.enable_deny_443 = 1;
+    cfg.enable_deny_443 = 0; /* iptables/nftables REDIRECT handles :443; BPF-LSM audit only */
     cfg.audit_file_open = 1;
     cfg.audit_bprm_check = 1;
     cfg.enforce_file_write = 0; /* default off; enable via AGW_ENFORCE_FILE_WRITE=1 */
@@ -82,13 +82,25 @@ int main(int argc, char **argv)
         goto out;
     }
 
+    /* Remove stale pins from previous runs (killed loaders leave pins behind). */
     mkdir(PIN_DIR, 0755); /* ignore EEXIST; bpffs pin dir */
+    bpf_object__unpin_maps(skel->obj, PIN_DIR);
     err = bpf_object__pin_maps(skel->obj, PIN_DIR);
-    if (err && err != -EEXIST)
+    if (err)
         fprintf(stderr, "warning: pin maps failed: %d\n", err);
 
+    /* Make pinned maps world-readable so non-root audit_consumer can open them. */
+    {
+        char path[256];
+        const char *maps[] = {"audit_buf", "config_map", "identity_map", "rules_map"};
+        for (int i = 0; i < 4; i++) {
+            snprintf(path, sizeof(path), "%s/%s", PIN_DIR, maps[i]);
+            chmod(path, 0666);
+        }
+    }
+
     printf("[AgentGateway] BPF-LSM loaded, maps pinned to %s\n", PIN_DIR);
-    printf("[AgentGateway] hooks: lsm/socket_connect (DENY direct :443), "
+    printf("[AgentGateway] hooks: lsm/socket_connect (audit :443), "
            "lsm/file_open, lsm/bprm_check\n");
 
     signal(SIGINT, on_signal);

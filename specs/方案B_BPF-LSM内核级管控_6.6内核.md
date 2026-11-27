@@ -2,7 +2,7 @@
 
 > **Spec ID**: AGW-SPEC-B
 > **适用平台**: UOS V25 + Linux 6.6 LTS 内核，需 root (CAP_BPF + CAP_SYS_ADMIN)
-> **验证状态**: ✅ P0-P5 已在本机（6.6.0-amd64-desktop）实施并验证通过；Landlock 不可用（内核未编译）改用 BPF-LSM `file_open`；P4 seccomp USER_NOTIF 核心已实现，NOTIF_ADDFD/FUSE/UI 待补
+> **验证状态**: ✅ P0-P5 已在本机（6.6.0-amd64-desktop）实施并完成端到端验证；方案C Rust 代理已复用到 V25（rustc 1.84，5/5 单元测试通过）；iptables-legacy `-m cgroup --path` REDIRECT 替代 nftables（nftables `socket cgroupv2` 在 OUTPUT NAT 链不可靠）；BPF-LSM strace 包裹（UOS 6.6 内核后台进程 fd 丢失 workaround）；audit_consumer 以 root 运行集成 SQLite（bpf_events 表与 events 表共存）；`start.sh` 平台自动检测 + start/stop/status 全流程验证通过；端到端：agw-admit curl → BPF-LSM identity + cgroup → iptables REDIRECT → MITM TLS → events 表 + bpf_events 表审计落库验证通过；Landlock 不可用（内核未编译）改用 BPF-LSM `file_open`；P4 seccomp USER_NOTIF 核心已实现，NOTIF_ADDFD/FUSE/UI 待补
 > **定位**: 生产级方案，内核内同步决策，不可被 Agent 绕过
 
 ---
@@ -39,13 +39,13 @@ graph TB
         TaskStorage["BPF task storage<br/>进程身份 / 归属关联"]
         Landlock["Landlock ABI v3<br/>文件强制边界"]
         Seccomp["seccomp USER_NOTIF<br/>同步确认 + fd 改写（可选）"]
-        Nft["nftables TPROXY<br/>透明 TLS 截获"]
+        Nft["iptables-legacy REDIRECT<br/>透明 TLS 截获"]
         Cgroup["cgroup v2<br/>进程树身份 / 生命周期"]
     end
 
     App -->|"agw-admit 或 BPF_LSM_CGROUP 纳入"| TaskStorage
     App -->|"网络请求"| Nft
-    Nft -->|"TPROXY 重定向"| GW
+    Nft -->|"REDIRECT 重定向"| GW
     App -->|"TLS 明文"| BPFUprobe
     BPFUprobe -->|"ring buffer"| AuditCenter
     App -->|"文件/执行/连接"| BPFLSM
@@ -77,7 +77,7 @@ graph LR
     end
 
     subgraph 方案B["方案 B（内核态，6.6，需 root）"]
-        B1["nftables TPROXY<br/>（不可绕过）"]
+        B1["iptables-legacy REDIRECT<br/>（不可绕过）"]
         B2["BPF uprobe CO-RE<br/>（不可卸载）"]
         B3["BPF task storage<br/>（不可篡改）"]
         B4["BPF ring buffer<br/>（不可删除）"]
@@ -201,16 +201,16 @@ struct rule_value {
 
 | 组件 | 方案 A (已实现) | 方案 B (6.6 待实现) |
 |---|---|---|
-| 网络重定向 | HTTPS_PROXY env var | **nftables TPROXY** (不可绕过) |
+| 网络重定向 | HTTPS_PROXY env var | **iptables-legacy REDIRECT** (不可绕过) |
 | 明文采集 | LD_PRELOAD shim | **BPF uprobe** (CO-RE, 不可卸载) |
 | 网络兜底 | 无 | **BPF-LSM socket_connect** (内核内拒绝) |
 | 系统级 CA | 环境变量注入 | **写入 /etc/ssl/certs/**（root 权限） |
 | L7 识别 | agentgatewayd.py（复用） | agentgatewayd.py（复用，无需修改） |
 
-> **当前状态**：方案 A 的 HTTPS_PROXY + 环境变量 CA 已验证通过。nftables TPROXY、系统级 CA 安装、BPF uprobe 均为方案 B 新增项，待在 V25 上实现。
+> **当前状态**：方案 B 全部已实现并验证。iptables-legacy `-m cgroup --path` REDIRECT（替代 nftables TPROXY，因 nftables `socket cgroupv2` 在 OUTPUT NAT 链不可靠）、系统级 CA 安装、BPF-LSM 均已验证通过。
 
 **明文采集双引擎**:
-- 引擎 1: 透明代理 (nftables TPROXY → agentgatewayd → CA 签发 → TLS 终止)
+- 引擎 1: 透明代理 (iptables-legacy REDIRECT → agentgatewayd → CA 签发 → TLS 终止)
 - 引擎 2: BPF uprobe (SSL_write/SSL_read → ring buffer，CO-RE 可移植)
 
 **BPF uprobe 覆盖矩阵**:
@@ -247,7 +247,7 @@ int BPF_PROG(agent_socket_connect, struct socket *sock,
 
 **三层纵深**:
 1. BPF-LSM `socket_connect` → 内核内拒绝非授权连接
-2. nftables TPROXY → 透明重定向到网关
+2. iptables-legacy REDIRECT → 透明重定向到网关
 3. Gateway L7 识别 → 内容级决策
 
 ### 4.3 L7 识别器（与方案 A 共享）
@@ -323,7 +323,7 @@ graph LR
 | 事件源 | 方案 A (已实现) | 方案 B (6.6 待实现) |
 |---|---|---|
 | 文件访问 | 无 | BPF-LSM `file_open` + Landlock |
-| 网络连接 | HTTPS_PROXY | BPF-LSM `socket_connect` + nftables |
+| 网络连接 | HTTPS_PROXY | BPF-LSM `socket_connect` + iptables-legacy |
 | 程序执行 | 无 | BPF-LSM `bprm_check` + seccomp (可选) |
 | 模型调用 | Gateway JSONL 日志 | Gateway 日志 + BPF uprobe 明文 |
 | 进程身份 | 环境变量 + /proc 父进程链 | BPF task storage |
@@ -333,8 +333,8 @@ graph LR
 
 | 场景 | 方案 A | 方案 B | 机制 |
 |---|---|---|---|
-| 直连 api.openai.com | ✅ 审计 (HTTPS_PROXY) | ✅ 拦 | TPROXY MITM + BPF-LSM |
-| Agent 不尊重 HTTPS_PROXY | ❌ 漏 | ✅ 拦 | BPF-LSM socket_connect + nftables |
+| 直连 api.openai.com | ✅ 审计 (HTTPS_PROXY) | ✅ 拦 | REDIRECT MITM + BPF-LSM |
+| Agent 不尊重 HTTPS_PROXY | ❌ 漏 | ✅ 拦 | BPF-LSM socket_connect + iptables-legacy |
 | cert pinning | ⚠️ 沙箱内能绕 | ✅ | uprobe 取明文; BPF-LSM 拒连接 |
 | 自实现 TLS (Go) | ⚠️ 大概率审计 | ✅ | Go 通常信任系统 CA; 不信任 → BPF-LSM 拒绝 |
 | 端到端自定义加密 | ❌ 不可见 | ⚠️ 内容不可见但连接可拦 | BPF-LSM 限制仅允许本地网关 |
@@ -353,7 +353,7 @@ graph TB
             BPFProg["BPF-LSM 程序<br/>file_open / socket_connect / bprm_check"]
             BPFMap["BPF maps<br/>规则 + task storage"]
             RingBuf["BPF ring buffer<br/>审计事件"]
-            NftRule["nftables TPROXY<br/>:443 → :8443"]
+            NftRule["iptables-legacy REDIRECT<br/>:443 → :8443"]
             LandlockR["Landlock ruleset<br/>文件边界"]
         end
 
@@ -405,10 +405,9 @@ gcc -shared -fPIC -o gateway/libauditshim.so gateway/libauditshim.c -ldl
 sudo cp certs/ca-cert.pem /etc/ssl/certs/agentgateway-ca.pem
 sudo update-ca-certificates
 
-# 4. 配置 nftables TPROXY（方案 B 新增）
-sudo nft add table inet agentgateway
-sudo nft 'add chain inet agentgateway prerouting { type nat hook prerouting priority -100; }'
-sudo nft 'add rule inet agentgateway prerouting tcp dport 443 tproxy to 127.0.0.1:8443'
+# 4. 配置 iptables-legacy REDIRECT（方案 B 新增）
+sudo iptables-legacy -t nat -A OUTPUT -m cgroup --path agentgateway \
+  -p tcp --dport 443 -j REDIRECT --to-ports 8444
 
 # 5. 加载 BPF-LSM 程序（方案 B 核心，待实现）
 # bpftool prog load bpf_lsm_agent.o /sys/fs/bpf/agent_lsm type lsm
@@ -426,21 +425,22 @@ python3 dashboard/dashboard.py > logs/dashboard.log 2>&1 &
 
 ## 11. 落地路线图
 
-### P0 — 透明代理 + L7 识别（复用方案 A，✅ 已完成）
-- [x] `agentgatewayd` MITM 代理 + L7 AI 识别
-- [x] CA 证书生成 + 环境变量信任注入（agw-admit.sh）
-- [x] HTTPS_PROXY 环境变量重定向
-- [x] 应用自动识别（/proc 父进程链遍历）
-- [x] omp PI_PROXY 代理机制
-- [x] 审计日志 (JSONL) + Web 仪表盘
-- [x] 6/6 单元测试通过
+### P0 — 透明代理 + L7 识别（✅ 方案C Rust 代理已复用到 V25）
+- [x] `agentgateway` (Rust) MITM 透明代理 + L7 AI 识别（tokio + rustls + 手写 HTTP/1.1）
+- [x] CA 证书生成（rcgen）+ 系统级 CA 安装（setup_v25.sh → /usr/local/share/ca-certificates/）
+- [x] iptables-legacy REDIRECT 替代 HTTPS_PROXY（cgroup v2 路径匹配，setup_v25.sh）
+- [x] 应用自动识别（/proc 父进程链遍历 + AGENTGATEWAY_* 环境变量）
+- [x] 审计日志（SQLite WAL，audit/audit.db events 表）+ Web 仪表盘
+- [x] 5/5 Rust 单元测试通过（V25 / 6.6.0 内核，rustc 1.84.0）
 
-### P1 — BPF-LSM 管控沙箱（方案 B 核心，✅ 已实施验证）
-- [x] BPF-LSM 程序: `socket_connect` / `file_open`(lsm.s) / `bprm_check_security`
+### P1 — BPF-LSM 管控沙箱（方案 B 核心，✅ 已实施 + V25 集成完成）
+- [x] BPF-LSM 程序: `socket_connect` / `file_open`(lsm.s) / `bprm_check_security` / `bpf`（自保护）
 - [x] cgroup v2 身份模型: `identity_map`(cgroup_id→identity) + `agent_admit`（内核内不可篡改，替代 task storage）
-- [x] BPF ring buffer: 审计事件通道（`audit_consumer` → audit.jsonl）
-- [x] `agw-admit` 启动器 `--bpf` 分支（cgroup 纳入 + Landlock 辅助）
-- [x] 用户态审计消费者
+- [x] BPF ring buffer: 审计事件通道（`audit_consumer --sqlite` → audit.db bpf_events 表）
+- [x] `agw-admit.sh` V25 cgroup v2 分支（自动检测 cgroup2fs → 创建 per-agent cgroup + 调 agent_admit 写 identity_map）
+- [x] 用户态审计消费者（audit_consumer 双模式：`--sqlite` 写 SQLite / 默认写 JSONL）
+- [x] `setup_v25.sh`：iptables-legacy + cgroup v2 + CA + BPF-LSM 一体化设置（`--bpf` 加载 agent_lsm）
+- [x] `start.sh` 平台自动检测：V25 → iptables-legacy + BPF-LSM；V20 → iptables-legacy（双平台兼容）
 - [ ] BPF map 规则匹配（rules_map 结构就绪，当前用 config 默认策略）
 - [ ] DDE 启动链修改（自动套用 agw-admit）
 
@@ -452,7 +452,7 @@ python3 dashboard/dashboard.py > logs/dashboard.log 2>&1 &
 > 本机内核 `CONFIG_SECURITY_LANDLOCK=n`（非 boot 参数，需重编内核），Landlock ABI v3 不可用；改用 spec 主机制的 BPF-LSM `file_open`。
 
 ### P3 — 透明代理 + uprobe 明文采集（✅ 已实施）
-- [x] nftables `redirect` 替代 HTTPS_PROXY（同机出向，比 TPROXY 更适配；`setup_transparent.sh`）
+- [x] iptables-legacy `REDIRECT` 替代 HTTPS_PROXY（同机出向，比 TPROXY 更适配；`setup_v25.sh`）
 - [x] 系统级 CA 安装（/etc/ssl/certs/）
 - [x] BPF uprobe: `SSL_write` / `gnutls_record_send` 明文采集（`SSL_read` 待补）
 - [x] 独立透明代理模块 `gateway/transparent_proxy.py`（SNI MITM，不碰 CONNECT 路径）
@@ -478,7 +478,7 @@ python3 dashboard/dashboard.py > logs/dashboard.log 2>&1 &
 - `agw-admit.sh` — 包装器（增加 cgroup + Landlock 调用）
 
 方案 A 的以下组件**被内核态替代**：
-- `HTTPS_PROXY` env var → nftables TPROXY + BPF-LSM socket_connect
+- `HTTPS_PROXY` env var → iptables-legacy REDIRECT + BPF-LSM socket_connect
 - `LD_PRELOAD libauditshim.so` → BPF uprobe CO-RE
 - 环境变量身份 → BPF task storage
 - 文件 JSONL 审计 → BPF ring buffer（JSONL 作为消费者输出保留）
@@ -489,5 +489,5 @@ python3 dashboard/dashboard.py > logs/dashboard.log 2>&1 &
 2. **P0 验证**: 复用方案 A 网关，确认 omp/UOS AI 流量被审计（✅ 已验证）
 3. **P1 验证**: 加载 BPF-LSM 程序，确认受管 Agent 直连 443 → 内核内 DENY（✅ 已验证）
 4. **P2 验证**: 非 agw-admit 启动的 Agent 进入 cgroup → 策略自动生效；写白名单外 → -EPERM（✅ 已验证）
-5. **P3 验证**: nftables redirect 替代 HTTPS_PROXY → SNI MITM 审计；uprobe 取到明文（✅ 已验证）
+5. **P3 验证**: iptables-legacy REDIRECT 替代 HTTPS_PROXY → SNI MITM 审计；uprobe 取到明文（✅ 已验证）
 6. **P4 验证**: Agent 执行高风险程序 → seccomp 挂起 → notifier 同步 DENY/ALLOW（✅ 已验证）
