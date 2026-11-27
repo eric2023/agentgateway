@@ -1,8 +1,5 @@
-# Runtime-generated files (not tracked)
-certs/dyn-*
-certs/*-key.pem
-certs/ca-key.pem
-certs/*.bak
+# Certificates (runtime-generated, contains private keys — never track)
+/certs/
 
 # Logs
 logs/
